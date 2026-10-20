@@ -10,12 +10,14 @@ MAX_HOLDINGS = 30
 def clean_holdings(raw: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """Return (holdings with Ticker/Shares, list of warnings).
 
-    Upper-cases tickers, drops blank or non-positive rows, merges duplicates,
-    and enforces the 30-holding limit.
+    Upper-cases tickers, converts class shares (BRK.B to BRK-B), drops blank or
+    non-positive rows, merges duplicates, and enforces the 30-holding limit.
     """
     warnings: list[str] = []
     df = raw.copy()
     df["Ticker"] = df["Ticker"].astype("string").str.strip().str.upper()
+    # Class shares: brokers write BRK.B, Yahoo Finance uses BRK-B.
+    df["Ticker"] = df["Ticker"].str.replace(r"^([A-Z]+)\.([A-Z])$", r"\1-\2", regex=True)
     df["Shares"] = pd.to_numeric(df["Shares"], errors="coerce")
     df = df[df["Ticker"].notna() & (df["Ticker"] != "")]
     bad = df[~(df["Shares"] > 0)]

@@ -27,7 +27,10 @@ from shock_lab.model import (
     stress_periods,
     to_frequency,
 )
+from shock_lab.compare import compare_scenarios
+from shock_lab.importers import TEMPLATE_CSV, parse_holdings_csv
 from shock_lab.portfolio import MAX_HOLDINGS, clean_holdings
+from shock_lab.report import to_excel, to_pdf
 from shock_lab.replay import REPLAYS, replay_accuracy, run_replay
 from shock_lab.sample import SAMPLE_BETAS, make_sample_data
 from shock_lab.shocks import PRESETS
@@ -110,23 +113,58 @@ with st.sidebar:
         "On = estimate those moves from history. Off = hold them at 0.",
     )
 
+    saved = st.session_state.setdefault("saved_scenarios", {})
+    with st.expander("Save this scenario to compare later"):
+        name = st.text_input("Name", placeholder="e.g. Oil spike + rate hike")
+        if st.button("Save scenario", disabled=not name.strip()):
+            saved[name.strip()] = dict(shock)
+            st.success(f"Saved \"{name.strip()}\". See the Compare scenarios tab.")
+        if saved and st.button("Clear saved scenarios"):
+            saved.clear()
+
 # ---- Holdings input ----
 st.subheader(f"1. Your holdings (up to {MAX_HOLDINGS})")
-default_rows = (
-    pd.DataFrame({"Ticker": list(SAMPLE_BETAS), "Shares": [50, 20, 40, 60]})
-    if use_sample
-    else pd.DataFrame({"Ticker": ["AAPL", "XOM", "JPM", "NEE", "DAL"], "Shares": [20, 30, 15, 25, 40]})
+mode = st.radio(
+    "How do you want to add holdings?",
+    ["Type them in", "Upload a CSV"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
-edited = st.data_editor(
-    default_rows,
-    num_rows="dynamic",
-    key=f"holdings_{use_sample}",
-    column_config={
-        "Ticker": st.column_config.TextColumn(required=True),
-        "Shares": st.column_config.NumberColumn(min_value=0.0, step=1.0, required=True),
-    },
-    width="stretch",
-)
+column_config = {
+    "Ticker": st.column_config.TextColumn(required=True),
+    "Shares": st.column_config.NumberColumn(min_value=0.0, step=1.0, required=True),
+}
+if mode == "Type them in":
+    default_rows = (
+        pd.DataFrame({"Ticker": list(SAMPLE_BETAS), "Shares": [50, 20, 40, 60]})
+        if use_sample
+        else pd.DataFrame({"Ticker": ["AAPL", "XOM", "JPM", "NEE", "DAL"], "Shares": [20, 30, 15, 25, 40]})
+    )
+    edited = st.data_editor(
+        default_rows, num_rows="dynamic", key=f"holdings_{use_sample}", column_config=column_config, width="stretch"
+    )
+else:
+    st.caption(
+        "Upload a positions export from your broker (Fidelity, Schwab, Vanguard, E*TRADE and others), "
+        "or any CSV with a Ticker/Symbol column and a Shares/Quantity column. Your file stays on this computer."
+    )
+    up_col, tmpl_col = st.columns([3, 1])
+    uploaded = up_col.file_uploader("Holdings CSV", type=["csv", "txt"], label_visibility="collapsed")
+    tmpl_col.download_button("Download a template", TEMPLATE_CSV, "shock_lab_holdings_template.csv", "text/csv")
+    if uploaded is None:
+        st.stop()
+    try:
+        parsed, notes = parse_holdings_csv(uploaded.getvalue())
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
+    for n in notes:
+        st.info(n)
+    st.caption(f"Found {len(parsed)} positions. You can edit them below before running.")
+    edited = st.data_editor(
+        parsed, num_rows="dynamic", key=f"upload_{uploaded.name}_{uploaded.size}", column_config=column_config,
+        width="stretch",
+    )
 holdings, warnings = clean_holdings(edited)
 for w in warnings:
     st.info(w)
@@ -174,7 +212,12 @@ impacts = holding_impacts(models, holdings, prices.ffill().iloc[-1], moves, stre
 normal = portfolio_summary(impacts)
 stress = portfolio_summary(impacts.dropna(subset=["Stress impact ($)"]), "Stress impact ($)")
 
-tab_scn, tab_replay, tab_model = st.tabs(["Scenario", "Historical replays", "Model details"])
+last_prices = prices.ffill().iloc[-1]
+replay_table, replay_event = None, None
+
+tab_scn, tab_cmp, tab_replay, tab_model, tab_export = st.tabs(
+    ["Scenario", "Compare scenarios", "Historical replays", "Model details", "Export"]
+)
 
 # ---- Scenario tab ----
 with tab_scn:
@@ -245,6 +288,7 @@ with tab_replay:
     except ValueError as e:
         st.info(f"Not enough data for this event: {e}")
     else:
+        replay_table, replay_event = table, event
         st.caption(
             "What the factors did: "
             + ", ".join(
@@ -308,5 +352,79 @@ with tab_model:
                        annotation_text=f"Used now ({models[tick].betas[factor]:.2f})")
         line.update_layout(height=360)
         st.plotly_chart(line, width="stretch")
+
+# ---- Compare scenarios tab ----
+with tab_cmp:
+    current_label = "Current sidebar scenario"
+    options = list(PRESETS) + list(saved) + [current_label]
+    picked = st.multiselect("Scenarios to compare", options, default=list(PRESETS) + list(saved))
+    scenarios = {n: (shock if n == current_label else saved.get(n, PRESETS.get(n))) for n in picked}
+    if not scenarios:
+        st.info("Pick at least one scenario.")
+        cmp_summary, cmp_holdings = pd.DataFrame(), pd.DataFrame()
+    else:
+        cmp_summary, cmp_holdings = compare_scenarios(
+            scenarios, models, stress_models, holdings, last_prices, factors, co_move
+        )
+        bars = go.Figure()
+        bars.add_bar(x=cmp_summary["Scenario"], y=cmp_summary["Normal ($)"], name="Normal times",
+                     marker_color=[GREEN if v > 0 else RED for v in cmp_summary["Normal ($)"]])
+        bars.add_bar(x=cmp_summary["Scenario"], y=cmp_summary["Stress ($)"], name="Stress times", marker_color=GREY)
+        bars.update_layout(barmode="group", height=380, yaxis_title="Estimated portfolio impact ($)",
+                           legend=dict(orientation="h", y=1.1))
+        st.plotly_chart(bars, width="stretch")
+        st.dataframe(
+            cmp_summary.style.format({"Normal ($)": money, "Normal (%)": pct, "Stress ($)": money, "Stress (%)": pct}),
+            hide_index=True,
+            width="stretch",
+        )
+        st.markdown("**Estimated impact per holding ($, normal times)**")
+        st.dataframe(cmp_holdings.style.format(money), width="stretch")
+        st.caption("Save your own scenarios from the sidebar to add them here.")
+
+# ---- Export tab ----
+with tab_export:
+    st.markdown("Download your results to keep, share or open in Excel.")
+    settings = [
+        ("Holdings", f"{len(impacts)} positions"),
+        ("Betas fit on", f"last {years} year(s), {freq} returns"),
+        ("Stress betas", f"worst {STRESS_QUANTILE:.0%} of market periods since 2006"),
+        ("Co-moves of unset factors", "included" if co_move else "held at 0"),
+        ("Data", "made-up sample data" if use_sample else "Yahoo Finance and FRED"),
+    ]
+    scenario_desc = ", ".join(
+        f"{FACTOR_LABELS[f].split(' (')[0]} {moves[f]:+.2f} pts" if f == "rates"
+        else f"{FACTOR_LABELS[f].split(' (')[0]} {moves[f] * 100:+.1f}%"
+        for f in FACTORS
+    )
+    summary_rows = [
+        ("Scenario (factor moves used)", scenario_desc),
+        ("Portfolio value", f"${normal['value']:,.0f}"),
+        ("Estimated change, normal times", f"{money(normal['impact'])} ({normal['impact_pct']:+.2f}%)"),
+        ("Estimated change, stress times", f"{money(stress['impact'])} ({stress['impact_pct']:+.2f}%)"),
+    ]
+    beta_export = pd.DataFrame({t: m.betas for t, m in models.items()}).T.rename(columns=FACTOR_LABELS)
+    beta_export.insert(0, "Ticker", beta_export.index)
+    sheets = {"Scenario": impacts, "Betas": beta_export.reset_index(drop=True)}
+    if not cmp_summary.empty:
+        sheets["Compare scenarios"] = cmp_summary
+        sheets["Compare by holding"] = cmp_holdings.reset_index(names="Ticker")
+    if replay_table is not None:
+        sheets["Replay"] = replay_table
+
+    stamp = pd.Timestamp.today().strftime("%Y-%m-%d")
+    e1, e2, e3 = st.columns(3)
+    e1.download_button("Scenario results (CSV)", impacts.to_csv(index=False), f"shock_lab_scenario_{stamp}.csv",
+                       "text/csv", width="stretch")
+    e2.download_button("All tables (Excel)", to_excel(sheets), f"shock_lab_{stamp}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+    pdf_tables = [("Current scenario", impacts.drop(columns=["Shares", "Low (%)", "High (%)"]))]
+    if not cmp_summary.empty:
+        pdf_tables.append(("Scenario comparison", cmp_summary))
+    if replay_table is not None:
+        pdf_tables.append((f"Historical replay: {replay_event}", replay_table))
+    e3.download_button("Report (PDF)", to_pdf("Shock Lab report", settings, summary_rows, pdf_tables, DISCLAIMER),
+                       f"shock_lab_report_{stamp}.pdf", "application/pdf", width="stretch")
+    st.caption("The Excel file includes the scenario, betas, scenario comparison and the replay you last viewed.")
 
 st.caption(DISCLAIMER)
