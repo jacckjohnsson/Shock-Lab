@@ -16,11 +16,11 @@ FRED_SERIES = {
 }
 MARKET_TICKER = "SPY"  # proxy for "the market" (S&P 500)
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+HISTORY_START = date(2006, 1, 2)  # early enough to replay 2008; the dollar series starts in 2006
 
 
-def default_window(years: int = 10) -> tuple[date, date]:
-    end = date.today()
-    return end - timedelta(days=365 * years + years // 4), end
+def history_window() -> tuple[date, date]:
+    return HISTORY_START, date.today() + timedelta(days=1)
 
 
 def fetch_prices(tickers: list[str], start: date, end: date) -> pd.DataFrame:

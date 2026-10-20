@@ -14,7 +14,7 @@ SAMPLE_BETAS = {
 }
 
 
-def make_sample_data(n_days: int = 2520, seed: int = 0) -> tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
+def make_sample_data(n_days: int = 5400, seed: int = 0) -> tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
     """Return (market prices, macro levels, stock prices) generated from known betas."""
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range(end="2026-10-16", periods=n_days)

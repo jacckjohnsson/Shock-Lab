@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from statsmodels.regression.rolling import RollingOLS
 
 FACTORS = ["market", "oil", "rates", "dollar"]
 FACTOR_LABELS = {
@@ -15,27 +16,54 @@ FACTOR_LABELS = {
     "rates": "10-yr yield (pct points)",
     "dollar": "US dollar (%)",
 }
-MIN_OBSERVATIONS = 250  # about one year of trading days
+MIN_OBSERVATIONS = 60
+PERIODS_PER_YEAR = {"daily": 252, "weekly": 52}
+STRESS_QUANTILE = 0.20  # "stress" = the worst 20% of market periods
+
+
+def to_frequency(levels: pd.DataFrame | pd.Series, freq: str) -> pd.DataFrame | pd.Series:
+    """Daily levels as-is, or the last value of each week (Friday)."""
+    if freq == "weekly":
+        return levels.resample("W-FRI").last()
+    return levels
 
 
 def build_factor_returns(market_prices: pd.Series, macro_levels: pd.DataFrame) -> pd.DataFrame:
-    """Turn price/level series into daily factor moves.
+    """Turn price/level series into factor moves for each period.
 
     market, oil, dollar: simple % returns (as decimals).
     rates: change in yield, in percentage points (1.0 = +1%).
     """
     macro = macro_levels.reindex(market_prices.index).ffill()
     out = pd.DataFrame(index=market_prices.index)
-    out["market"] = market_prices.pct_change()
+    out["market"] = market_prices.pct_change(fill_method=None)
     # WTI briefly went negative in April 2020, which makes % changes meaningless.
     oil = macro["oil"].where(macro["oil"] > 0)
     out["oil"] = oil.pct_change(fill_method=None)
     out["rates"] = macro["rates"].diff()
     out["dollar"] = macro["dollar"].pct_change(fill_method=None)
     out = out.replace([np.inf, -np.inf], np.nan)
-    # Drop absurd one-day oil moves that remain around the negative-price episode.
+    # Drop absurd oil moves that remain around the negative-price episode.
     out.loc[out["oil"].abs() > 0.5, "oil"] = np.nan
     return out.dropna()
+
+
+def stock_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    return prices.pct_change(fill_method=None)
+
+
+def last_years(df: pd.DataFrame, years: float, end: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Rows in the `years` before `end` (exclusive), or before the last row if end is None."""
+    if end is None:
+        end = df.index.max() + pd.Timedelta(days=1)
+    start = end - pd.DateOffset(days=round(365.25 * years))
+    return df.loc[(df.index >= start) & (df.index < end)]
+
+
+def stress_periods(factors: pd.DataFrame, quantile: float = STRESS_QUANTILE) -> pd.Index:
+    """Dates when the market return was in its worst `quantile`."""
+    cutoff = factors["market"].quantile(quantile)
+    return factors.index[factors["market"] <= cutoff]
 
 
 @dataclass
@@ -45,14 +73,14 @@ class FactorModel:
     betas: pd.Series  # indexed by FACTORS
     beta_cov: pd.DataFrame  # covariance of the beta estimates
     r_squared: float
-    residual_vol: float  # daily
+    residual_vol: float  # per period
     n_obs: int
 
 
-def fit_factor_model(ticker: str, stock_returns: pd.Series, factors: pd.DataFrame) -> FactorModel:
-    data = pd.concat([stock_returns.rename("y"), factors[FACTORS]], axis=1).dropna()
+def fit_factor_model(ticker: str, returns: pd.Series, factors: pd.DataFrame) -> FactorModel:
+    data = pd.concat([returns.rename("y"), factors[FACTORS]], axis=1, join="inner").dropna()
     if len(data) < MIN_OBSERVATIONS:
-        raise ValueError(f"{ticker}: only {len(data)} days of overlapping data (need {MIN_OBSERVATIONS}).")
+        raise ValueError(f"{ticker}: only {len(data)} periods of overlapping data (need {MIN_OBSERVATIONS}).")
     X = sm.add_constant(data[FACTORS])
     res = sm.OLS(data["y"], X).fit()
     cov = res.cov_params().loc[FACTORS, FACTORS]
@@ -67,16 +95,24 @@ def fit_factor_model(ticker: str, stock_returns: pd.Series, factors: pd.DataFram
     )
 
 
-def fit_all(prices: pd.DataFrame, factors: pd.DataFrame) -> tuple[dict[str, FactorModel], dict[str, str]]:
+def fit_all(returns: pd.DataFrame, factors: pd.DataFrame) -> tuple[dict[str, FactorModel], dict[str, str]]:
     """Fit one model per ticker. Returns (models, errors by ticker)."""
-    returns = prices.pct_change(fill_method=None)
     models, errors = {}, {}
-    for t in prices.columns:
+    for t in returns.columns:
         try:
             models[t] = fit_factor_model(t, returns[t], factors)
         except ValueError as e:
             errors[t] = str(e)
     return models, errors
+
+
+def rolling_betas(returns: pd.Series, factors: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Betas re-estimated over a moving window (e.g. 252 days = 1 year)."""
+    data = pd.concat([returns.rename("y"), factors[FACTORS]], axis=1, join="inner").dropna()
+    if len(data) < window + 1:
+        return pd.DataFrame(columns=FACTORS)
+    res = RollingOLS(data["y"], sm.add_constant(data[FACTORS]), window=window).fit()
+    return res.params[FACTORS].dropna()
 
 
 def implied_factor_moves(shock: dict[str, float], factors: pd.DataFrame) -> pd.Series:
@@ -99,45 +135,59 @@ def implied_factor_moves(shock: dict[str, float], factors: pd.DataFrame) -> pd.S
     return moves
 
 
+def predicted_return(model: FactorModel, factor_moves: pd.Series) -> tuple[float, float]:
+    """(estimated return, its standard error from beta uncertainty)."""
+    s = factor_moves[FACTORS].values.astype(float)
+    ret = float(model.betas[FACTORS].values @ s)
+    se = float(np.sqrt(max(s @ model.beta_cov.values @ s, 0.0)))
+    return ret, se
+
+
 def holding_impacts(
     models: dict[str, FactorModel],
     holdings: pd.DataFrame,
     last_prices: pd.Series,
     factor_moves: pd.Series,
+    stress_models: dict[str, FactorModel] | None = None,
 ) -> pd.DataFrame:
     """Estimated % and $ impact per holding with a ~95% range from beta uncertainty.
 
-    holdings: columns Ticker, Shares.
+    holdings: columns Ticker, Shares. If stress_models is given, adds the same
+    scenario estimated with betas fit only on stress periods.
     """
-    s = factor_moves[FACTORS].values
     rows = []
     for _, h in holdings.iterrows():
         t = h["Ticker"]
         if t not in models:
             continue
-        m = models[t]
-        ret = float(m.betas[FACTORS].values @ s)
-        se = float(np.sqrt(max(s @ m.beta_cov.values @ s, 0.0)))
+        ret, se = predicted_return(models[t], factor_moves)
         value = float(h["Shares"]) * float(last_prices[t])
-        rows.append(
-            {
-                "Ticker": t,
-                "Shares": float(h["Shares"]),
-                "Price": float(last_prices[t]),
-                "Value ($)": value,
-                "Impact (%)": ret * 100,
-                "Low (%)": (ret - 1.96 * se) * 100,
-                "High (%)": (ret + 1.96 * se) * 100,
-                "Impact ($)": value * ret,
-                "R²": m.r_squared,
-            }
-        )
+        row = {
+            "Ticker": t,
+            "Shares": float(h["Shares"]),
+            "Price": float(last_prices[t]),
+            "Value ($)": value,
+            "Impact (%)": ret * 100,
+            "Low (%)": (ret - 1.96 * se) * 100,
+            "High (%)": (ret + 1.96 * se) * 100,
+            "Impact ($)": value * ret,
+        }
+        if stress_models is not None:
+            if t in stress_models:
+                s_ret, _ = predicted_return(stress_models[t], factor_moves)
+                row["Stress impact (%)"] = s_ret * 100
+                row["Stress impact ($)"] = value * s_ret
+            else:
+                row["Stress impact (%)"] = np.nan
+                row["Stress impact ($)"] = np.nan
+        row["R²"] = models[t].r_squared
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
-def portfolio_summary(impacts: pd.DataFrame) -> dict[str, float]:
+def portfolio_summary(impacts: pd.DataFrame, column: str = "Impact ($)") -> dict[str, float]:
     total_value = impacts["Value ($)"].sum()
-    total_impact = impacts["Impact ($)"].sum()
+    total_impact = impacts[column].sum()
     return {
         "value": float(total_value),
         "impact": float(total_impact),

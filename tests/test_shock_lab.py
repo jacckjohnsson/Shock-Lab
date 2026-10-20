@@ -11,6 +11,11 @@ from shock_lab.model import (
     holding_impacts,
     implied_factor_moves,
     portfolio_summary,
+    last_years,
+    rolling_betas,
+    stock_returns,
+    stress_periods,
+    to_frequency,
 )
 from shock_lab.portfolio import MAX_HOLDINGS, clean_holdings
 from shock_lab.sample import SAMPLE_BETAS, make_sample_data
@@ -21,7 +26,7 @@ from shock_lab.shocks import PRESETS
 def sample():
     market, macro, prices = make_sample_data()
     factors = build_factor_returns(market, macro)
-    models, errors = fit_all(prices, factors)
+    models, errors = fit_all(stock_returns(prices), factors)
     return market, macro, prices, factors, models, errors
 
 
@@ -65,9 +70,9 @@ def test_macro_gaps_are_forward_filled():
 
 
 def test_too_little_history_raises():
-    idx = pd.bdate_range("2024-01-01", periods=50)
-    factors = pd.DataFrame(np.random.default_rng(1).normal(size=(50, 4)) * 0.01, index=idx, columns=FACTORS)
-    with pytest.raises(ValueError, match="overlapping data"):
+    idx = pd.bdate_range("2024-01-01", periods=30)
+    factors = pd.DataFrame(np.random.default_rng(1).normal(size=(30, 4)) * 0.01, index=idx, columns=FACTORS)
+    with pytest.raises(ValueError, match="overlapping"):
         fit_factor_model("NEW", pd.Series(0.01, index=idx), factors)
 
 
@@ -143,3 +148,84 @@ def test_fetch_prices_handles_yfinance_multiindex(monkeypatch):
     out = fetch_prices(["AAPL", "SPY"], date(2024, 1, 1), date(2024, 1, 4))
     assert list(out.columns) == ["AAPL", "SPY"]
     assert out.index.tz is None
+
+
+def test_stress_impacts_and_summary(sample):
+    _, _, prices, factors, models, _ = sample
+    returns = stock_returns(prices)
+    idx = stress_periods(factors)
+    assert len(idx) == pytest.approx(0.2 * len(factors), rel=0.02)
+    assert (factors.loc[idx, "market"] <= factors["market"].quantile(0.2)).all()
+    stress_models, errors = fit_all(returns.loc[returns.index.isin(idx)], factors.loc[idx])
+    assert not errors
+    holdings = pd.DataFrame({"Ticker": ["OILCO", "TECHCO"], "Shares": [10, 5]})
+    moves = pd.Series({"market": -0.15, "oil": 0.0, "rates": 0.0, "dollar": 0.0})
+    out = holding_impacts(models, holdings, prices.iloc[-1], moves, stress_models)
+    assert out["Stress impact (%)"].notna().all()
+    s = portfolio_summary(out, "Stress impact ($)")
+    assert s["impact"] == pytest.approx(out["Stress impact ($)"].sum())
+
+
+def test_last_years_window():
+    idx = pd.bdate_range("2015-01-01", "2024-12-31")
+    df = pd.DataFrame({"x": 1.0}, index=idx)
+    w = last_years(df, 2)
+    assert w.index.min() >= pd.Timestamp("2022-12-31") and w.index.max() == idx.max()
+    before = last_years(df, 1, end=pd.Timestamp("2020-02-19"))
+    assert before.index.max() < pd.Timestamp("2020-02-19")
+    assert before.index.min() >= pd.Timestamp("2019-02-18")
+
+
+def test_weekly_frequency_recovers_betas(sample):
+    market, macro, prices, *_ = sample
+    f = build_factor_returns(to_frequency(market, "weekly"), to_frequency(macro, "weekly"))
+    r = stock_returns(to_frequency(prices, "weekly"))
+    assert (f.index.dayofweek == 4).all()
+    models, errors = fit_all(r, f)
+    assert not errors
+    # Weekly data is ~5x fewer points, so allow a looser tolerance on the market beta.
+    assert models["TECHCO"].betas["market"] == pytest.approx(SAMPLE_BETAS["TECHCO"][0], abs=0.1)
+
+
+def test_rolling_betas_shape(sample):
+    _, _, prices, factors, *_ = sample
+    rb = rolling_betas(stock_returns(prices)["OILCO"], factors, 252)
+    assert list(rb.columns) == FACTORS
+    assert len(rb) == len(factors) - 251
+    assert rb["oil"].mean() == pytest.approx(SAMPLE_BETAS["OILCO"][1], abs=0.05)
+
+
+def test_replay_uses_only_pre_event_data_and_matches_truth(sample):
+    from shock_lab.replay import period_factor_moves, replay_accuracy, run_replay
+
+    market, macro, prices, *_ = sample
+    holdings = pd.DataFrame({"Ticker": list(SAMPLE_BETAS), "Shares": 10})
+    table, moves = run_replay(holdings, prices, market, macro, "2020-02-19", "2020-03-23", years=3)
+    assert set(moves.index) == set(FACTORS)
+    assert table["Predicted (%)"].notna().all() and table["Actual (%)"].notna().all()
+    # Predictions should match the true betas applied to the event's factor moves.
+    truth = {t: np.array(b) @ moves[FACTORS].values * 100 for t, b in SAMPLE_BETAS.items()}
+    for _, row in table.iterrows():
+        assert row["Predicted (%)"] == pytest.approx(truth[row["Ticker"]], abs=1.0)
+    assert replay_accuracy(table)["n"] == 4
+    # Changing prices after the event starts must not change the predictions (no look-ahead).
+    shifted = prices.copy()
+    shifted.loc["2020-02-19":] *= 1.5
+    table2, _ = run_replay(holdings, shifted, market, macro, "2020-02-19", "2020-03-23", years=3)
+    np.testing.assert_allclose(table2["Predicted (%)"], table["Predicted (%)"])
+    # Period moves are computed from start and end levels.
+    m = period_factor_moves(market, macro, "2020-02-19", "2020-03-23")
+    s = market.loc["2020-02-19":"2020-03-23"]
+    assert m["market"] == pytest.approx(s.iloc[-1] / s.iloc[0] - 1)
+
+
+def test_replay_marks_tickers_without_history(sample):
+    from shock_lab.replay import run_replay
+
+    market, macro, prices, *_ = sample
+    prices = prices.copy()
+    prices.loc[:"2021-06-01", "UTILCO"] = np.nan  # "IPO" after the event
+    holdings = pd.DataFrame({"Ticker": ["OILCO", "UTILCO"], "Shares": 10})
+    table, _ = run_replay(holdings, prices, market, macro, "2020-02-19", "2020-03-23", years=3)
+    row = table.set_index("Ticker").loc["UTILCO"]
+    assert np.isnan(row["Predicted (%)"]) and np.isnan(row["Actual (%)"])

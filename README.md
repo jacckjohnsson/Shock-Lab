@@ -45,7 +45,14 @@ CSV downloads. If you are offline, turn on **"Use made-up sample data"** in the 
 | Rates | FRED `DGS10` (10-year Treasury yield) | change in percentage points |
 | Dollar | FRED `DTWEXBGS` (broad trade-weighted dollar index) | % change |
 
-Up to 10 years of daily data are used. FRED series that skip a trading day are carried forward. Oil prices went
+Data is downloaded back to 2006 (so the 2008 crisis can be replayed). FRED series that skip a trading day are
+carried forward.
+
+**Model settings (sidebar):**
+- **History used to fit betas:** 1, 2, 3, 5 or 10 years. Shorter windows react to how a stock behaves lately but
+  are noisier.
+- **Return frequency:** daily or weekly. Stock prices close at 4pm New York time, but FRED's macro series are
+  recorded at slightly different times, which blurs daily betas. Weekly returns (Friday to Friday) reduce that. Oil prices went
 negative in April 2020, so % changes around those days are dropped.
 
 ### 2. A factor regression for each stock
@@ -74,7 +81,33 @@ and the dollar impact is `shares × last price × R̂ᵢ`. The portfolio impact 
 $\widehat{R}_i \pm 1.96\sqrt{\mathbf{s}^\top \Sigma_{\beta_i} \mathbf{s}}$, where $\Sigma_{\beta_i}$ is the
 covariance of the beta estimates. This only captures estimation error, not the stock's own random noise.
 
-### 4. Factors move together
+### 4. Normal times vs stress times
+
+Correlations change in a crisis: in selloffs, stocks tend to move together more. Shock Lab fits a second set of
+betas using **only the worst 20% of market periods since 2006** and shows the same scenario with those betas next
+to the normal estimate. A big gap between the two means a holding behaves differently when markets are falling.
+(Because it keeps only 1 in 5 periods, the stress model always uses the full history.)
+
+### 5. Historical replays (is the model any good?)
+
+The **Historical replays** tab tests the model on real events: the 2008 financial crisis, the COVID crash of
+2020 and the 2022 rate shock. For each event it:
+
+1. fits betas using **only data from before the event started** (no peeking at the answer),
+2. measures what the four factors actually did during the event,
+3. predicts each holding's return as β·(actual factor moves), and
+4. compares that with the holding's actual return.
+
+The scatter plot shows predicted vs actual; dots on the diagonal were predicted perfectly. "Avg. miss per holding"
+is the mean absolute error in percentage points. Holdings that didn't trade yet, or lacked enough history before
+the event, are listed separately.
+
+### 6. Rolling betas
+
+The **Model details** tab charts each beta re-estimated over a moving 1-year window, so you can see how a stock's
+sensitivity to oil or rates has changed over time, and compare it with the beta currently in use.
+
+### 7. Factors move together
 
 Oil rarely jumps 20% while everything else stands still. With **"Include typical co-moves"** on, the factors
 you didn't set are filled in with their expected value given the ones you did, using the historical factor
@@ -90,11 +123,12 @@ The **Scenario** table in the app shows both what you set and what the model use
 
 - **Linear and scaled up.** Betas are fit on small daily moves and applied to large shocks. Real reactions to a
   20% oil spike may not be proportional.
-- **Constant betas.** One beta across 10 years ignores that relationships change. Rolling or recent-weighted
-  betas are a natural next step.
-- **Correlations change in crises.** In selloffs, correlations tend to jump toward 1. A "stress-period" model
-  fit only on bad days would show this.
-- **Daily data timing.** FRED and stock closes are not at exactly the same time, which can blur betas.
+- **Betas still assumed constant within the window.** Exponentially weighted regressions would put more
+  weight on recent data without a hard cutoff.
+- **Stress definition is simple.** "Worst 20% of market periods" could be replaced with VIX levels or
+  recession dates.
+- **Replays use one beta for the whole event.** Real betas shift during a crisis, and the four factors miss
+  things like credit spreads and company news.
 - **Data licensing.** `yfinance` is fine for a personal project, but not licensed for a paid product.
 
 ## Project layout
@@ -105,6 +139,7 @@ shock_lab/data.py       Downloads from Yahoo Finance and FRED
 shock_lab/model.py      Factor returns, regressions, shock math
 shock_lab/portfolio.py  Cleans the holdings you type in
 shock_lab/shocks.py     Preset scenarios
+shock_lab/replay.py     Historical replays (2008, 2020, 2022)
 shock_lab/sample.py     Made-up data with known betas (offline demo and tests)
 tests/                  pytest tests
 ```
