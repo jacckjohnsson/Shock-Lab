@@ -34,6 +34,23 @@ pytest
 No API keys are needed. Prices come from Yahoo Finance (via `yfinance`) and macro data from FRED's public
 CSV downloads. If you are offline, turn on **"Use made-up sample data"** in the sidebar.
 
+## Using the app
+
+**Add your holdings** either way:
+- **Type them in:** best for a handful of positions.
+- **Upload a CSV:** a positions export from your broker (Fidelity, Schwab, Vanguard, E*TRADE and others) or
+  any file with a `Ticker`/`Symbol` column and a `Shares`/`Quantity` column. Shock Lab finds the header row,
+  skips cash, money market funds, totals and notes, merges the same stock held in several accounts, and
+  converts class shares like `BRK.B` to Yahoo's `BRK-B`. You can edit the result before running. A template
+  is available in the app.
+
+**Tabs:**
+- **Scenario:** the sidebar scenario, normal vs stress estimates, per holding and in total.
+- **Compare scenarios:** the four presets plus any scenarios you saved from the sidebar, side by side.
+- **Historical replays:** predicted vs actual for 2008, 2020 and 2022.
+- **Model details:** betas and how they changed over time.
+- **Export:** the current scenario as CSV, every table as an Excel workbook, or a one-page PDF report.
+
 ## How it works
 
 ### 1. Data
@@ -140,6 +157,9 @@ shock_lab/model.py      Factor returns, regressions, shock math
 shock_lab/portfolio.py  Cleans the holdings you type in
 shock_lab/shocks.py     Preset scenarios
 shock_lab/replay.py     Historical replays (2008, 2020, 2022)
+shock_lab/compare.py    Several scenarios side by side
+shock_lab/importers.py  Reads holdings CSVs and broker exports
+shock_lab/report.py     Excel and PDF exports
 shock_lab/sample.py     Made-up data with known betas (offline demo and tests)
 tests/                  pytest tests
 ```
