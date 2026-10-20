@@ -5,6 +5,7 @@ Run with:  streamlit run app.py
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -28,6 +29,15 @@ from shock_lab.model import (
     to_frequency,
 )
 from shock_lab.compare import compare_scenarios
+from shock_lab.hedging import (
+    CONTRACT_SIZE,
+    HEDGES,
+    HedgeSetup,
+    compare_hedges,
+    payoff_table,
+    put_greeks_table,
+    vix_market_beta,
+)
 from shock_lab.importers import TEMPLATE_CSV, parse_holdings_csv
 from shock_lab.portfolio import MAX_HOLDINGS, clean_holdings
 from shock_lab.report import to_excel, to_pdf
@@ -215,8 +225,10 @@ stress = portfolio_summary(impacts.dropna(subset=["Stress impact ($)"]), "Stress
 last_prices = prices.ffill().iloc[-1]
 replay_table, replay_event = None, None
 
-tab_scn, tab_cmp, tab_replay, tab_model, tab_export = st.tabs(
-    ["Scenario", "Compare scenarios", "Historical replays", "Model details", "Export"]
+hedge_table = None
+
+tab_scn, tab_cmp, tab_hedge, tab_replay, tab_model, tab_export = st.tabs(
+    ["Scenario", "Compare scenarios", "Hedging", "Historical replays", "Model details", "Export"]
 )
 
 # ---- Scenario tab ----
@@ -273,6 +285,122 @@ with tab_scn:
         "Low/High is a rough 95% range from uncertainty in the estimated betas only. "
         "R² shows how much of a stock's movement the four factors explain (0 to 1)."
     )
+
+# ---- Hedging tab ----
+with tab_hedge:
+    st.markdown(
+        "How would common hedges have changed the result of this scenario? These hedges all use the "
+        "S&P 500 (SPY), so they only offset the part of a scenario that moves the stock market. "
+        "**This shows how hedges behave in a model. It is not a recommendation to buy or sell anything.**"
+    )
+    vix_series = macro["vix"].dropna() if "vix" in macro else pd.Series(dtype=float)
+    tbill_series = macro["tbill"].dropna() if "tbill" in macro else pd.Series(dtype=float)
+    if vix_series.empty:
+        st.info("VIX data is unavailable, so a VIX of 20 is assumed.")
+    vix_now = float(vix_series.iloc[-1]) if not vix_series.empty else 20.0
+    rate_now = float(tbill_series.iloc[-1]) / 100 if not tbill_series.empty else 0.04
+    daily_mkt = last_years(market.pct_change(fill_method=None).dropna().to_frame("m"), years)["m"]
+    vbeta = vix_market_beta(vix_series.reindex(market.index).ffill(), daily_mkt) if not vix_series.empty else -120.0
+
+    h1, h2 = st.columns(2)
+    regime = h1.radio("Betas", ["Normal times", "Stress times"], horizontal=True, key="hedge_regime")
+    horizon_label = h2.radio("Shock happens", ["Instantly", "In 1 week", "In 1 month"], horizontal=True)
+    c1, c2, c3 = st.columns(3)
+    hedge_ratio = c1.slider("Share of market exposure to hedge", 0, 100, 50, 5, format="%d%%") / 100
+    strike_pct = c2.select_slider(
+        "Put strike", options=[0.85, 0.90, 0.95, 1.00], value=0.95,
+        format_func=lambda k: "At the money" if k == 1.0 else f"{(1 - k):.0%} below today",
+    )
+    expiry_days = c3.select_slider(
+        "Put expiry", options=[30, 90, 180, 365], value=90,
+        format_func=lambda d: {30: "1 month", 90: "3 months", 180: "6 months", 365: "1 year"}[d],
+    )
+
+    use_models = stress_models if regime == "Stress times" else models
+    tickers = [t for t in impacts["Ticker"] if t in use_models]
+    values = impacts.set_index("Ticker").loc[tickers, "Value ($)"].values
+    B = pd.DataFrame({t: use_models[t].betas for t in tickers}).T[FACTORS].values
+
+    def portfolio_impact_for(market_move: float) -> float:
+        m = {"market": market_move}
+        mv = implied_factor_moves(m, factors) if co_move else pd.Series(m).reindex(FACTORS).fillna(0.0)
+        return float(values @ (B @ mv[FACTORS].values))
+
+    dollar_beta = portfolio_impact_for(0.01) / 0.01
+    scenario_impact = float(values @ (B @ moves[FACTORS].values))
+    spot = float(market.dropna().iloc[-1])
+    setup = HedgeSetup(
+        spot=spot, vix=vix_now, rate=rate_now, dollar_beta=dollar_beta, hedge_ratio=hedge_ratio,
+        strike_pct=strike_pct, expiry_days=expiry_days,
+        horizon_days={"Instantly": 0, "In 1 week": 7, "In 1 month": 30}[horizon_label], vix_beta=vbeta,
+    )
+    mkt_move = float(moves["market"])
+    vix_after = float(np.clip(vix_now + vbeta * mkt_move, 9, 80))
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Market exposure", f"${dollar_beta / 100:,.0f} per 1%",
+              help="How many dollars the portfolio tends to move for each 1% move in the S&P 500, "
+              "including the typical co-moves of oil, rates and the dollar if that option is on.")
+    k2.metric("SPY price", f"${spot:,.2f}")
+    k3.metric("VIX now → in scenario", f"{vix_now:.1f} → {vix_after:.1f}")
+    k4.metric("S&P move in scenario", f"{mkt_move * 100:+.1f}%")
+
+    if abs(mkt_move) < 0.005:
+        st.info("This scenario barely moves the S&P 500, so S&P hedges do little here. "
+                "Try the S&P 500 -15% preset, or turn on co-moves in the sidebar.")
+    n_contracts, exact = setup.contracts()
+    if exact > 0 and abs(n_contracts - exact) / exact > 0.25:
+        st.warning(
+            f"One SPY option covers about ${CONTRACT_SIZE * spot:,.0f} of the S&P 500. Hedging {hedge_ratio:.0%} "
+            f"of your exposure needs {exact:.2f} contracts, so {n_contracts} contract(s) "
+            f"{'over' if n_contracts > exact else 'under'}-hedges by a lot. For smaller portfolios, the "
+            "inverse ETF or raising cash can be sized to the exact dollar amount."
+        )
+
+    hedge_table = compare_hedges(setup, mkt_move, scenario_impact, 0.10, portfolio_impact_for(0.10))
+    up_col = [c for c in hedge_table.columns if c.startswith("Hedge if S&P")][0]
+    st.dataframe(
+        hedge_table.style.format(
+            {"Upfront cost ($)": "${:,.0f}", "Cash needed ($)": "${:,.0f}", "Hedge gain/loss ($)": money,
+             "Portfolio + hedge ($)": money, "Loss offset (%)": lambda v: "n/a" if pd.isna(v) else f"{v:.0f}%",
+             up_col: money}
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption(
+        "Upfront cost = option premium you pay today. Cash needed = money tied up in the hedge. "
+        "The last column shows what each hedge costs you if the S&P rises 10% instead, the price of protection."
+    )
+
+    grid = np.round(np.arange(-0.30, 0.2001, 0.01), 2)
+    pay = payoff_table(setup, portfolio_impact_for, grid)
+    fig = px.line(pay, x="S&P 500 move (%)", y="Change ($)", color="Hedge",
+                  category_orders={"Hedge": HEDGES}, labels={"Change ($)": "Portfolio + hedge change ($)"})
+    fig.update_traces(selector=dict(name="No hedge"), line=dict(color="#212121", width=3))
+    fig.add_vline(x=mkt_move * 100, line_dash="dot", line_color=GREY, annotation_text="This scenario")
+    fig.add_hline(y=0, line_color=GREY, line_width=1)
+    fig.update_layout(height=420, legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Each line shows your portfolio plus that hedge across different S&P 500 moves. "
+               "Flatter on the left = more protection; lower on the right = more upside given up.")
+
+    with st.expander("Option greeks for the put hedges"):
+        st.dataframe(
+            put_greeks_table(setup).style.format(
+                {"Implied vol used (%)": "{:.1f}", "Delta (SPY shares)": "{:+.1f}",
+                 "Dollar delta ($ per 1% S&P move)": money, "Gamma (delta change per $1 SPY)": "{:.3f}",
+                 "Vega ($ per 1 vol point)": "${:,.0f}", "Theta ($ per day)": money}
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            "Delta: how many SPY shares the position acts like. Gamma: how fast delta grows as SPY moves. "
+            "Vega: gain if volatility rises 1 point. Theta: value lost per day from time passing. "
+            "Prices use Black-Scholes with the VIX as volatility plus a simple skew for lower strikes, "
+            "so real quotes will differ."
+        )
 
 # ---- Historical replays tab ----
 with tab_replay:
@@ -409,6 +537,8 @@ with tab_export:
     if not cmp_summary.empty:
         sheets["Compare scenarios"] = cmp_summary
         sheets["Compare by holding"] = cmp_holdings.reset_index(names="Ticker")
+    if hedge_table is not None:
+        sheets["Hedging"] = hedge_table
     if replay_table is not None:
         sheets["Replay"] = replay_table
 
@@ -421,10 +551,12 @@ with tab_export:
     pdf_tables = [("Current scenario", impacts.drop(columns=["Shares", "Low (%)", "High (%)"]))]
     if not cmp_summary.empty:
         pdf_tables.append(("Scenario comparison", cmp_summary))
+    if hedge_table is not None:
+        pdf_tables.append(("Hedges in this scenario", hedge_table.drop(columns=["What it means"])))
     if replay_table is not None:
         pdf_tables.append((f"Historical replay: {replay_event}", replay_table))
     e3.download_button("Report (PDF)", to_pdf("Shock Lab report", settings, summary_rows, pdf_tables, DISCLAIMER),
                        f"shock_lab_report_{stamp}.pdf", "application/pdf", width="stretch")
-    st.caption("The Excel file includes the scenario, betas, scenario comparison and the replay you last viewed.")
+    st.caption("The Excel file includes the scenario, betas, scenario comparison, hedges and the replay you last viewed.")
 
 st.caption(DISCLAIMER)
