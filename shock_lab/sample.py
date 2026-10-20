@@ -40,4 +40,12 @@ def make_sample_data(n_days: int = 5400, seed: int = 0) -> tuple[pd.Series, pd.D
     for t, b in SAMPLE_BETAS.items():
         r = f[1:] @ np.array(b) + rng.normal(0, 0.008, n_days - 1)
         stocks[t] = 100 * np.cumprod(np.r_[1.0, 1 + r])
+    # VIX: mean-reverts to 18 and jumps when the market falls (about +1.2 points per -1%).
+    vix = np.empty(n_days)
+    vix[0] = 18.0
+    shocks = rng.normal(0, 0.8, n_days)
+    for i in range(1, n_days):
+        vix[i] = np.clip(vix[i - 1] + 0.05 * (18 - vix[i - 1]) - 120 * f[i, 0] + shocks[i], 9, 80)
+    macro["vix"] = vix
+    macro["tbill"] = 4.0
     return market, macro, pd.DataFrame(stocks, index=idx)

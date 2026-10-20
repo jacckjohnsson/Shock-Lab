@@ -47,6 +47,7 @@ CSV downloads. If you are offline, turn on **"Use made-up sample data"** in the 
 **Tabs:**
 - **Scenario:** the sidebar scenario, normal vs stress estimates, per holding and in total.
 - **Compare scenarios:** the four presets plus any scenarios you saved from the sidebar, side by side.
+- **Hedging:** how index puts, a put spread, an inverse ETF or raising cash would change the scenario's result.
 - **Historical replays:** predicted vs actual for 2008, 2020 and 2022.
 - **Model details:** betas and how they changed over time.
 - **Export:** the current scenario as CSV, every table as an Excel workbook, or a one-page PDF report.
@@ -124,7 +125,43 @@ the event, are listed separately.
 The **Model details** tab charts each beta re-estimated over a moving 1-year window, so you can see how a stock's
 sensitivity to oil or rates has changed over time, and compare it with the beta currently in use.
 
-### 7. Factors move together
+### 7. Hedging
+
+The **Hedging** tab shows how common hedges would behave in the current scenario. It is a model of how
+hedges work, not a recommendation.
+
+**Sizing.** Every hedge is sized from the portfolio's *market exposure*: the dollars it tends to move per 1% move
+in the S&P 500 (its beta-weighted, or "dollar", beta). With co-moves on, this includes the oil, rate and dollar
+moves that usually come with a market move. The hedge ratio slider picks how much of that exposure to cover.
+
+| Hedge | How it's modeled |
+| --- | --- |
+| Index puts | Buy SPY puts. Contracts = ratio × exposure ÷ (100 × SPY price), rounded to whole contracts |
+| Put spread | Buy a put and sell one 10% lower: cheaper, but protection stops at the lower strike |
+| Inverse ETF | Hold a -1x S&P 500 ETF (like SH) worth ratio × exposure; gains 1% for each 1% the S&P falls |
+| Raise cash | Sell the same share of every holding, which cuts every exposure, not just the market |
+
+**Option pricing.** Puts are priced with Black-Scholes (with SPY's ~1.3% dividend yield):
+
+$$
+P = K e^{-rT} N(-d_2) - S e^{-qT} N(-d_1), \quad
+d_1 = \frac{\ln(S/K) + (r - q + \tfrac{1}{2}\sigma^2)T}{\sigma\sqrt{T}}, \quad d_2 = d_1 - \sigma\sqrt{T}
+$$
+
+- **Volatility σ** comes from the VIX (FRED `VIXCLS`), plus a simple *skew*: +0.6 vol points for each 1% the
+  strike is below the current price, since lower-strike puts trade at higher volatility.
+- **Volatility in a crash.** Shock Lab regresses daily VIX changes on S&P 500 returns (typically about +1.2 VIX
+  points per -1% day) and moves the VIX with the scenario's market move. This is why puts gain more in a crash
+  than the price move alone suggests.
+- **Rate r** is the 3-month T-bill rate (FRED `DTB3`).
+- **Timing.** "Shock happens instantly / in 1 week / in 1 month" lets time decay (theta) eat into the puts first.
+
+The greeks (delta, gamma, vega, theta) for the put positions are shown in an expander.
+
+**Small portfolios.** One SPY option covers 100 shares, roughly $60,000 of the S&P 500. The app warns when whole
+contracts badly over- or under-hedge a small portfolio; the inverse ETF and raising cash can be sized exactly.
+
+### 8. Factors move together
 
 Oil rarely jumps 20% while everything else stands still. With **"Include typical co-moves"** on, the factors
 you didn't set are filled in with their expected value given the ones you did, using the historical factor
@@ -146,6 +183,8 @@ The **Scenario** table in the app shows both what you set and what the model use
   recession dates.
 - **Replays use one beta for the whole event.** Real betas shift during a crisis, and the four factors miss
   things like credit spreads and company news.
+- **Hedging uses model prices.** Real option quotes, bid/ask spreads and the shape of volatility across
+  expiries will differ. Inverse ETFs reset daily, so over long periods they don't exactly track -1x.
 - **Data licensing.** `yfinance` is fine for a personal project, but not licensed for a paid product.
 
 ## Project layout
@@ -160,6 +199,8 @@ shock_lab/replay.py     Historical replays (2008, 2020, 2022)
 shock_lab/compare.py    Several scenarios side by side
 shock_lab/importers.py  Reads holdings CSVs and broker exports
 shock_lab/report.py     Excel and PDF exports
+shock_lab/options.py    Black-Scholes prices, greeks and skew
+shock_lab/hedging.py    Hedge sizing, costs and payoffs
 shock_lab/sample.py     Made-up data with known betas (offline demo and tests)
 tests/                  pytest tests
 ```

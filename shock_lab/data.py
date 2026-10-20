@@ -14,6 +14,11 @@ FRED_SERIES = {
     "rates": "DGS10",  # 10-year Treasury yield, percent
     "dollar": "DTWEXBGS",  # Broad trade-weighted US dollar index
 }
+# Extra FRED series used for option pricing, not as regression factors.
+PRICING_SERIES = {
+    "vix": "VIXCLS",  # CBOE VIX: 30-day implied volatility of the S&P 500, in vol points
+    "tbill": "DTB3",  # 3-month Treasury bill rate, percent
+}
 MARKET_TICKER = "SPY"  # proxy for "the market" (S&P 500)
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
 HISTORY_START = date(2006, 1, 2)  # early enough to replay 2008; the dollar series starts in 2006
@@ -55,7 +60,8 @@ def fetch_fred_series(series_id: str, name: str, timeout: float = 30) -> pd.Seri
 
 
 def fetch_macro(start: date, end: date) -> pd.DataFrame:
-    """Oil price, 10-year yield and dollar index levels, one column each."""
-    cols = [fetch_fred_series(sid, name) for name, sid in FRED_SERIES.items()]
+    """Oil, 10-year yield, dollar index, VIX and T-bill levels, one column each."""
+    series = {**FRED_SERIES, **PRICING_SERIES}
+    cols = [fetch_fred_series(sid, name) for name, sid in series.items()]
     df = pd.concat(cols, axis=1)
     return df.loc[pd.Timestamp(start) : pd.Timestamp(end)]
