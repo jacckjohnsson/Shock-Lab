@@ -7,6 +7,8 @@ import pandas as pd
 
 from .model import (
     FACTORS,
+    POINT_VARS,
+    SCENARIO_VARS,
     build_factor_returns,
     fit_all,
     last_years,
@@ -31,21 +33,23 @@ def _endpoints(series: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> tup
 
 
 def period_factor_moves(market: pd.Series, macro: pd.DataFrame, start, end) -> pd.Series:
-    """Total factor moves over a period, in the same units as a shock."""
+    """Total moves over a period, in the same units as a shock.
+
+    Covers the regression factors plus the VIX and credit spread when the data has them
+    (those two are shown for context; predictions use only the factors).
+    """
     start, end = pd.Timestamp(start), pd.Timestamp(end)
     moves = {}
-    for name, series, kind in [
-        ("market", market, "pct"),
-        ("oil", macro["oil"], "pct"),
-        ("rates", macro["rates"], "diff"),
-        ("dollar", macro["dollar"], "pct"),
-    ]:
-        ends = _endpoints(series, start, end)
+    for name in SCENARIO_VARS:
+        series = market if name == "market" else macro.get(name)
+        if series is None and name not in FACTORS:
+            continue
+        ends = None if series is None else _endpoints(series, start, end)
         if ends is None:
             raise ValueError(f"No {name} data at the start of this period.")
         a, b = ends
-        moves[name] = b - a if kind == "diff" else b / a - 1
-    return pd.Series(moves)[FACTORS]
+        moves[name] = b - a if name in POINT_VARS else b / a - 1
+    return pd.Series(moves)
 
 
 def run_replay(

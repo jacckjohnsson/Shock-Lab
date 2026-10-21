@@ -105,7 +105,7 @@ html, body, [data-testid="stAppViewContainer"] {{ font-family: {SANS}; }}
 </style>
 """
 
-STEPS = ["Holdings", "Scenario", "Impact", "Hedge", "Compare", "Check the model", "Export"]
+STEPS = ["Holdings", "Scenario", "Impact", "Hedge", "Simulate", "Optimize", "Compare", "Check the model", "Export"]
 
 
 def header_html() -> str:
@@ -146,9 +146,9 @@ def summary_card_html(
     stress: float,
     stress_pct: float,
     hardest: tuple[str, float, float] | None,
-    hedge_lines: list[str],
+    lines: list[str],
 ) -> str:
-    """The plain-English result. Every input string is escaped; hedge_lines may contain trusted span markup."""
+    """The plain-English result. Every input string is escaped; `lines` may contain trusted span markup."""
     verb = "lose" if normal < 0 else "gain"
     parts = [
         f'<div class="sl-card"><div class="k">If {escape(scenario_name)}</div>',
@@ -162,6 +162,6 @@ def summary_card_html(
     if hardest:
         t, d, p = hardest
         parts.append(f"<p>Hit hardest: <span class='mono accent'>{escape(t)}</span> at {money_html(d)} ({p:+.1f}%).</p>")
-    parts += [f"<p>{line}</p>" for line in hedge_lines]
+    parts += [f"<p>{line}</p>" for line in lines]
     parts.append("</div>")
     return "".join(parts)

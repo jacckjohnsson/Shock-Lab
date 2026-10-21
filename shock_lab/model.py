@@ -9,12 +9,22 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.regression.rolling import RollingOLS
 
-FACTORS = ["market", "oil", "rates", "dollar"]
+# Regression factors: every stock gets a beta on each of these.
+FACTORS = ["market", "oil", "rates", "dollar", "gold"]
+# Stress gauges you can shock but that are not regression factors. VIX and credit spreads move
+# almost in lockstep with the market, so as extra regressors they would make the betas unstable.
+# Instead, a VIX or credit shock is translated into the factor moves that have typically come with it.
+DRIVERS = ["vix", "credit"]
+SCENARIO_VARS = FACTORS + DRIVERS
+POINT_VARS = {"rates", "vix", "credit"}  # moves measured in points; the rest are % changes
 FACTOR_LABELS = {
     "market": "S&P 500 (%)",
     "oil": "Crude oil (%)",
     "rates": "10-yr yield (pct points)",
     "dollar": "US dollar (%)",
+    "gold": "Gold (%)",
+    "vix": "VIX (points)",
+    "credit": "Credit spread (pct points)",
 }
 MIN_OBSERVATIONS = 60
 PERIODS_PER_YEAR = {"daily": 252, "weekly": 52}
@@ -31,8 +41,9 @@ def to_frequency(levels: pd.DataFrame | pd.Series, freq: str) -> pd.DataFrame | 
 def build_factor_returns(market_prices: pd.Series, macro_levels: pd.DataFrame) -> pd.DataFrame:
     """Turn price/level series into factor moves for each period.
 
-    market, oil, dollar: simple % returns (as decimals).
-    rates: change in yield, in percentage points (1.0 = +1%).
+    market, oil, dollar, gold: simple % returns (as decimals).
+    rates, credit: change in percentage points (1.0 = +1%). vix: change in VIX points.
+    The stress gauges (vix, credit) are included when the macro data has them.
     """
     macro = macro_levels.reindex(market_prices.index).ffill()
     out = pd.DataFrame(index=market_prices.index)
@@ -42,6 +53,10 @@ def build_factor_returns(market_prices: pd.Series, macro_levels: pd.DataFrame) -
     out["oil"] = oil.pct_change(fill_method=None)
     out["rates"] = macro["rates"].diff()
     out["dollar"] = macro["dollar"].pct_change(fill_method=None)
+    out["gold"] = macro["gold"].pct_change(fill_method=None)
+    for d in DRIVERS:
+        if d in macro:
+            out[d] = macro[d].diff()
     out = out.replace([np.inf, -np.inf], np.nan)
     # Drop absurd oil moves that remain around the negative-price episode.
     out.loc[out["oil"].abs() > 0.5, "oil"] = np.nan
@@ -115,24 +130,41 @@ def rolling_betas(returns: pd.Series, factors: pd.DataFrame, window: int) -> pd.
     return res.params[FACTORS].dropna()
 
 
-def implied_factor_moves(shock: dict[str, float], factors: pd.DataFrame) -> pd.Series:
-    """Fill in the factors you didn't shock with their expected co-moves.
+def implied_factor_moves(shock: dict[str, float], factors: pd.DataFrame, co_move: bool = True) -> pd.Series:
+    """Fill in the variables you didn't shock with their expected co-moves.
 
-    If x is the vector of shocked factors, the expected move of the others is
+    If x is the vector of shocked variables, the expected move of the others is
     E[y | x] = Cov(y, x) Cov(x, x)^-1 x  (conditional mean of a multivariate normal).
+
+    co_move=False holds unset factors at 0, except that a VIX or credit shock is always
+    translated into factor moves (on its own it has no beta to act through).
     """
-    shocked = [f for f in FACTORS if shock.get(f, 0.0) != 0.0]
-    moves = pd.Series(0.0, index=FACTORS)
+    available = [v for v in SCENARIO_VARS if v in factors.columns]
+    moves = pd.Series(0.0, index=available)
+    shocked = [v for v in available if shock.get(v, 0.0) != 0.0]
     if not shocked:
         return moves
-    cov = factors[FACTORS].cov()
-    x = np.array([shock[f] for f in shocked])
-    others = [f for f in FACTORS if f not in shocked]
-    moves[shocked] = x
+    moves[shocked] = [shock[v] for v in shocked]
+    given = shocked if co_move else [v for v in shocked if v in DRIVERS]
+    if not given:
+        return moves
+    others = [v for v in available if v not in shocked] if co_move else [f for f in FACTORS if f not in shocked]
     if others:
-        weights = cov.loc[others, shocked].values @ np.linalg.inv(cov.loc[shocked, shocked].values)
-        moves[others] = weights @ x
+        cov = factors[available].cov()
+        weights = cov.loc[others, given].values @ np.linalg.pinv(cov.loc[given, given].values)
+        moves[others] = weights @ moves[given].values
     return moves
+
+
+def move_text(var: str, move: float) -> str:
+    """'S&P 500 -15.0%' or 'VIX +10.00 pts'."""
+    label = FACTOR_LABELS[var].split(" (")[0]
+    return f"{label} {move:+.2f} pts" if var in POINT_VARS else f"{label} {move * 100:+.1f}%"
+
+
+def display_units(var: str) -> float:
+    """Multiplier from model units to what the sliders and tables show."""
+    return 1.0 if var in POINT_VARS else 100.0
 
 
 def predicted_return(model: FactorModel, factor_moves: pd.Series) -> tuple[float, float]:

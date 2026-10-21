@@ -44,18 +44,21 @@ def test_regression_recovers_known_betas(sample):
 def test_factor_returns_units():
     idx = pd.bdate_range("2024-01-01", periods=3)
     market = pd.Series([100.0, 110.0, 99.0], index=idx)
-    macro = pd.DataFrame({"oil": [50.0, 55.0, 55.0], "rates": [4.0, 4.25, 4.0], "dollar": [100.0, 100.0, 102.0]}, index=idx)
+    macro = pd.DataFrame({"oil": [50.0, 55.0, 55.0], "rates": [4.0, 4.25, 4.0], "dollar": [100.0, 100.0, 102.0], "gold": [200.0, 202.0, 202.0], "vix": [15.0, 18.0, 17.0], "credit": [2.0, 2.0, 2.5]}, index=idx)
     f = build_factor_returns(market, macro)
     assert f.loc[idx[1], "market"] == pytest.approx(0.10)
     assert f.loc[idx[1], "oil"] == pytest.approx(0.10)
     assert f.loc[idx[1], "rates"] == pytest.approx(0.25)  # percentage points, not %
     assert f.loc[idx[2], "dollar"] == pytest.approx(0.02)
+    assert f.loc[idx[1], "gold"] == pytest.approx(0.01)
+    assert f.loc[idx[1], "vix"] == pytest.approx(3.0)  # VIX points
+    assert f.loc[idx[2], "credit"] == pytest.approx(0.5)  # percentage points
 
 
 def test_negative_oil_prices_are_dropped_not_crashing():
     idx = pd.bdate_range("2020-04-15", periods=5)
     market = pd.Series([100.0, 101, 102, 103, 104], index=idx)
-    macro = pd.DataFrame({"oil": [20.0, 10.0, -37.6, 10.0, 12.0], "rates": 1.0, "dollar": 100.0}, index=idx)
+    macro = pd.DataFrame({"oil": [20.0, 10.0, -37.6, 10.0, 12.0], "rates": 1.0, "dollar": 100.0, "gold": 200.0}, index=idx)
     f = build_factor_returns(market, macro)
     assert np.isfinite(f.values).all()
     assert idx[2] not in f.index and idx[3] not in f.index
@@ -64,14 +67,14 @@ def test_negative_oil_prices_are_dropped_not_crashing():
 def test_macro_gaps_are_forward_filled():
     idx = pd.bdate_range("2024-01-01", periods=4)
     market = pd.Series([100.0, 101, 102, 103], index=idx)
-    macro = pd.DataFrame({"oil": [50.0, 51.0, 52.0], "rates": [4.0, 4.1, 4.2], "dollar": [100.0, 101.0, 102.0]}, index=idx[[0, 1, 3]])
+    macro = pd.DataFrame({"oil": [50.0, 51.0, 52.0], "rates": [4.0, 4.1, 4.2], "dollar": [100.0, 101.0, 102.0], "gold": [200.0, 201.0, 202.0]}, index=idx[[0, 1, 3]])
     f = build_factor_returns(market, macro)
     assert idx[2] in f.index and f.loc[idx[2], "oil"] == 0.0
 
 
 def test_too_little_history_raises():
     idx = pd.bdate_range("2024-01-01", periods=30)
-    factors = pd.DataFrame(np.random.default_rng(1).normal(size=(30, 4)) * 0.01, index=idx, columns=FACTORS)
+    factors = pd.DataFrame(np.random.default_rng(1).normal(size=(30, len(FACTORS))) * 0.01, index=idx, columns=FACTORS)
     with pytest.raises(ValueError, match="overlapping"):
         fit_factor_model("NEW", pd.Series(0.01, index=idx), factors)
 
@@ -80,7 +83,7 @@ def test_direct_shock_impact_is_beta_times_move(sample):
     _, _, prices, _, models, _ = sample
     holdings = pd.DataFrame({"Ticker": ["OILCO"], "Shares": [10]})
     last = prices.iloc[-1]
-    moves = pd.Series({"market": 0.0, "oil": 0.20, "rates": 0.0, "dollar": 0.0})
+    moves = pd.Series({"market": 0.0, "oil": 0.20, "rates": 0.0, "dollar": 0.0, "gold": 0.0})
     out = holding_impacts(models, holdings, last, moves).iloc[0]
     beta_oil = models["OILCO"].betas["oil"]
     assert out["Impact (%)"] == pytest.approx(beta_oil * 20)
@@ -90,8 +93,9 @@ def test_direct_shock_impact_is_beta_times_move(sample):
 
 def test_implied_moves_match_conditional_mean():
     rng = np.random.default_rng(2)
-    cov = np.array([[1.0, 0.5, 0, 0], [0.5, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]])
-    factors = pd.DataFrame(rng.multivariate_normal(np.zeros(4), cov, size=200_000), columns=FACTORS)
+    cov = np.eye(len(FACTORS))
+    cov[0, 1] = cov[1, 0] = 0.5
+    factors = pd.DataFrame(rng.multivariate_normal(np.zeros(len(FACTORS)), cov, size=200_000), columns=FACTORS)
     moves = implied_factor_moves({"oil": 2.0}, factors)
     assert moves["oil"] == 2.0
     assert moves["market"] == pytest.approx(1.0, abs=0.02)  # 0.5 / 1.0 * 2
@@ -129,9 +133,10 @@ def test_parse_fred_csv_handles_missing_values():
     assert s.name == "rates"
 
 
-def test_presets_cover_the_four_factors():
-    assert len(PRESETS) == 4
-    assert {k for p in PRESETS.values() for k in p} == set(FACTORS)
+def test_presets_cover_every_scenario_variable():
+    from shock_lab.model import SCENARIO_VARS
+
+    assert {k for p in PRESETS.values() for k in p} == set(SCENARIO_VARS)
 
 
 def test_fetch_prices_handles_yfinance_multiindex(monkeypatch):
@@ -159,7 +164,7 @@ def test_stress_impacts_and_summary(sample):
     stress_models, errors = fit_all(returns.loc[returns.index.isin(idx)], factors.loc[idx])
     assert not errors
     holdings = pd.DataFrame({"Ticker": ["OILCO", "TECHCO"], "Shares": [10, 5]})
-    moves = pd.Series({"market": -0.15, "oil": 0.0, "rates": 0.0, "dollar": 0.0})
+    moves = pd.Series({"market": -0.15, "oil": 0.0, "rates": 0.0, "dollar": 0.0, "gold": 0.0})
     out = holding_impacts(models, holdings, prices.iloc[-1], moves, stress_models)
     assert out["Stress impact (%)"].notna().all()
     s = portfolio_summary(out, "Stress impact ($)")
@@ -201,7 +206,7 @@ def test_replay_uses_only_pre_event_data_and_matches_truth(sample):
     market, macro, prices, *_ = sample
     holdings = pd.DataFrame({"Ticker": list(SAMPLE_BETAS), "Shares": 10})
     table, moves = run_replay(holdings, prices, market, macro, "2020-02-19", "2020-03-23", years=3)
-    assert set(moves.index) == set(FACTORS)
+    assert set(FACTORS) <= set(moves.index)
     assert table["Predicted (%)"].notna().all() and table["Actual (%)"].notna().all()
     # Predictions should match the true betas applied to the event's factor moves.
     truth = {t: np.array(b) @ moves[FACTORS].values * 100 for t, b in SAMPLE_BETAS.items()}

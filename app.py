@@ -5,6 +5,8 @@ Run with:  streamlit run app.py
 
 from __future__ import annotations
 
+from dataclasses import replace
+from html import escape
 from pathlib import Path
 
 import numpy as np
@@ -16,26 +18,32 @@ import streamlit as st
 from shock_lab import brand, data
 from shock_lab.brand import AMBER, BORDER, CYAN, GREEN, LAVENDER, MUTED, RED, TEXT
 from shock_lab.compare import compare_scenarios
+from shock_lab.frontier import RETURN_METHODS, compare_portfolios, expected_returns, frontier_curve, model_portfolios
 from shock_lab.hedging import (
     CONTRACT_SIZE,
     HEDGES,
     HedgeSetup,
     compare_hedges,
+    hedge_pnl,
     payoff_table,
     put_greeks_table,
     vix_market_beta,
 )
 from shock_lab.importers import TEMPLATE_CSV, parse_holdings_csv
 from shock_lab.model import (
+    DRIVERS,
     FACTOR_LABELS,
     FACTORS,
     PERIODS_PER_YEAR,
+    SCENARIO_VARS,
     STRESS_QUANTILE,
     build_factor_returns,
+    display_units,
     fit_all,
     holding_impacts,
     implied_factor_moves,
     last_years,
+    move_text,
     portfolio_summary,
     rolling_betas,
     stock_returns,
@@ -43,8 +51,10 @@ from shock_lab.model import (
     to_frequency,
 )
 from shock_lab.portfolio import MAX_HOLDINGS, clean_holdings
+from shock_lab.montecarlo import HORIZONS, simulate, stats_table
 from shock_lab.replay import REPLAYS, replay_accuracy, run_replay
 from shock_lab.report import to_excel, to_pdf
+from shock_lab.risk import concentration, stock_covariance
 from shock_lab.sample import SAMPLE_BETAS, make_sample_data
 from shock_lab.shocks import PRESETS
 
@@ -85,8 +95,11 @@ def show_table(df: pd.DataFrame, formats: dict, signed: list[str] | None = None,
     st.dataframe(styler, width="stretch", **kwargs)
 
 
-def show_chart(fig: go.Figure, height: int | None = None) -> None:
-    st.plotly_chart(brand.style_chart(fig, height), theme=None, width="stretch")
+def show_chart(fig: go.Figure, height: int | None = None, **layout) -> None:
+    fig = brand.style_chart(fig, height)
+    if layout:
+        fig.update_layout(**layout)
+    st.plotly_chart(fig, theme=None, width="stretch")
 
 
 def step(n: int, title: str, subtitle: str = "") -> None:
@@ -94,19 +107,19 @@ def step(n: int, title: str, subtitle: str = "") -> None:
 
 
 def describe_moves(mv: pd.Series) -> str:
-    return ", ".join(
-        f"{FACTOR_LABELS[f].split(' (')[0]} {mv[f]:+.2f} pts" if f == "rates"
-        else f"{FACTOR_LABELS[f].split(' (')[0]} {mv[f] * 100:+.1f}%"
-        for f in FACTORS
-    )
+    return ", ".join(move_text(v, mv[v]) for v in SCENARIO_VARS if v in mv.index)
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Downloading prices and macro data…")
 def load_live(tickers: tuple[str, ...]):
     start, end = data.history_window()
-    prices = data.fetch_prices(sorted(set(tickers) | {data.MARKET_TICKER}), start, end)
+    prices = data.fetch_prices(sorted(set(tickers) | {data.MARKET_TICKER, data.GOLD_TICKER}), start, end)
     macro = data.fetch_macro(start, end)
     market = prices[data.MARKET_TICKER]
+    if data.GOLD_TICKER not in prices:
+        raise ValueError("Yahoo Finance returned no gold (GLD) prices.")
+    macro = macro.reindex(macro.index.union(prices.index))
+    macro["gold"] = prices[data.GOLD_TICKER]
     return market, macro, prices[[t for t in tickers if t in prices.columns]]
 
 
@@ -146,7 +159,7 @@ with st.sidebar:
     )
 
 ran = st.session_state.get("ran", False)
-steps_slot.html(brand.steps_html(7 if ran else 2))
+steps_slot.html(brand.steps_html(len(brand.STEPS) if ran else 2))
 
 # ---- Step 1: holdings ----
 step(1, "Your holdings", f"Up to {MAX_HOLDINGS} stocks or ETFs. Type them in, or upload a file from your broker.")
@@ -195,20 +208,24 @@ if holdings.empty:
     st.stop()
 
 # ---- Step 2: scenario ----
-step(2, "Choose a scenario", "Pick a preset or set your own moves. Factors left at 0 are filled in from history.")
+step(2, "Choose a scenario", "Pick a preset or set your own moves. Anything left at 0 is filled in from history.")
 preset_names = list(PRESETS) + ["Custom"]
 preset = st.pills("Preset", preset_names, default="S&P 500 -15%", label_visibility="collapsed") or "Custom"
 base = PRESETS.get(preset, {})
-s1, s2, s3, s4 = st.columns(4)
-shock = {
-    "market": s1.slider(FACTOR_LABELS["market"], -40.0, 40.0, base.get("market", 0.0) * 100, 1.0,
-                        key=f"sl_market_{preset}") / 100,
-    "oil": s2.slider(FACTOR_LABELS["oil"], -60.0, 60.0, base.get("oil", 0.0) * 100, 1.0, key=f"sl_oil_{preset}") / 100,
-    "rates": s3.slider(FACTOR_LABELS["rates"], -3.0, 3.0, base.get("rates", 0.0), 0.25, key=f"sl_rates_{preset}"),
-    "dollar": s4.slider(FACTOR_LABELS["dollar"], -20.0, 20.0, base.get("dollar", 0.0) * 100, 0.5,
-                        key=f"sl_dollar_{preset}") / 100,
+# (low, high, step) in the units shown on the slider
+SLIDER_RANGES = {
+    "market": (-40.0, 40.0, 1.0), "oil": (-60.0, 60.0, 1.0), "rates": (-3.0, 3.0, 0.25), "dollar": (-20.0, 20.0, 0.5),
+    "gold": (-30.0, 30.0, 1.0), "vix": (-15.0, 40.0, 1.0), "credit": (-1.5, 4.0, 0.25),
 }
-is_preset = preset in PRESETS and shock == {f: base.get(f, 0.0) for f in FACTORS}
+shock = {}
+for row in (FACTORS[:4], FACTORS[4:] + DRIVERS):
+    for col, v in zip(st.columns(4), row):
+        lo, hi, stp = SLIDER_RANGES[v]
+        unit = display_units(v)
+        shock[v] = col.slider(FACTOR_LABELS[v], lo, hi, base.get(v, 0.0) * unit, stp, key=f"sl_{v}_{preset}") / unit
+st.caption("VIX and credit spreads are stress gauges, not betas: a move in either is translated into the S&P, oil, "
+           "rates, dollar and gold moves that have typically come with it.")
+is_preset = preset in PRESETS and shock == {v: base.get(v, 0.0) for v in SCENARIO_VARS}
 scenario_name = preset if is_preset else "your custom scenario"
 
 saved = st.session_state.setdefault("saved_scenarios", {})
@@ -216,7 +233,7 @@ n1, n2, n3 = st.columns([3, 1, 1], vertical_alignment="bottom")
 name = n1.text_input("Save this scenario to compare later", placeholder="e.g. Oil spike + rate hike")
 if n2.button("Save scenario", disabled=not name.strip(), width="stretch"):
     saved[name.strip()] = dict(shock)
-    st.toast(f"Saved \"{name.strip()}\". It appears in step 5.")
+    st.toast(f"Saved \"{name.strip()}\". It appears in step 7.")
 if saved and n3.button("Clear saved", width="stretch"):
     saved.clear()
 
@@ -257,7 +274,7 @@ if not models:
 stress_idx = stress_periods(all_factors)
 stress_models, _ = fit_all(all_returns.loc[all_returns.index.isin(stress_idx)], all_factors.loc[stress_idx])
 
-moves = implied_factor_moves(shock, factors) if co_move else pd.Series(shock)[FACTORS]
+moves = implied_factor_moves(shock, factors, co_move).reindex(SCENARIO_VARS).fillna(0.0)
 last_prices = prices.ffill().iloc[-1]
 impacts = holding_impacts(models, holdings, last_prices, moves, stress_models)
 normal = portfolio_summary(impacts)
@@ -286,9 +303,9 @@ with right:
     st.markdown("**Factor moves**")
     scenario_tbl = pd.DataFrame(
         {
-            "Factor": [FACTOR_LABELS[f] for f in FACTORS],
-            "You set": [shock[f] * (1 if f == "rates" else 100) for f in FACTORS],
-            "Used": [moves[f] * (1 if f == "rates" else 100) for f in FACTORS],
+            "Factor": [FACTOR_LABELS[v] for v in SCENARIO_VARS],
+            "You set": [shock[v] * display_units(v) for v in SCENARIO_VARS],
+            "Used": [moves[v] * display_units(v) for v in SCENARIO_VARS],
         }
     )
     show_table(scenario_tbl, {"You set": "{:+.2f}", "Used": "{:+.2f}"}, ["You set", "Used"], hide_index=True)
@@ -306,7 +323,41 @@ show_table(
 )
 st.caption(
     "Low/High is a rough 95% range from uncertainty in the estimated betas only. "
-    "R² shows how much of a stock's movement the four factors explain (0 to 1)."
+    "R² shows how much of a stock's movement the five factors explain (0 to 1)."
+)
+
+st.markdown("**Concentration: is one holding running the show?**")
+ppy = PERIODS_PER_YEAR[freq]
+risk_tickers = [t for t in impacts["Ticker"] if t in models]
+position_values = impacts.set_index("Ticker")["Value ($)"]
+cov = stock_covariance(models, risk_tickers, factors, ppy)
+conc_table, conc, conc_warnings = concentration(position_values, cov)
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Yearly volatility", f"{conc['vol']:.1f}%",
+          help="How much the portfolio typically swings in a year (one standard deviation), from the factor model.")
+c2.metric("Acts like", f"{conc['effective_n']:.1f} positions",
+          help="1 / sum of squared weights. Ten equal holdings = 10. One big holding pulls this toward 1.")
+c3.metric("Largest position", f"{conc['top_weight']:.0f}%")
+c4.metric("Largest share of risk", f"{conc['top_risk']:.0f}%")
+if conc_warnings:
+    st.warning("\n".join(f"- {w}" for w in conc_warnings))
+else:
+    st.success("No single holding dominates this portfolio's value or risk.")
+cl, cr = st.columns([1, 1])
+with cl:
+    conc_fig = go.Figure()
+    conc_fig.add_bar(x=conc_table["Ticker"], y=conc_table["Weight (%)"], name="Share of value", marker_color=AMBER)
+    conc_fig.add_bar(x=conc_table["Ticker"], y=conc_table["Share of risk (%)"], name="Share of risk",
+                     marker_color=LAVENDER)
+    conc_fig.update_layout(barmode="group", yaxis_title="%")
+    show_chart(conc_fig, 300)
+with cr:
+    show_table(conc_table, {"Value ($)": "${:,.0f}", "Weight (%)": "{:.1f}%", "Share of risk (%)": "{:.1f}%",
+                            "Volatility (%/yr)": "{:.1f}%"}, hide_index=True)
+st.caption(
+    "Share of risk = how much of the portfolio's day-to-day swings come from each holding. A volatile stock can "
+    "carry far more risk than its share of value. Warnings appear above 25% of value, 35% of risk, or when the "
+    "portfolio acts like fewer than 4 equal positions."
 )
 
 # ---- Step 4: hedging ----
@@ -341,7 +392,7 @@ B = pd.DataFrame({t: use_models[t].betas for t in tickers}).T[FACTORS].values
 
 def portfolio_impact_for(market_move: float) -> float:
     m = {"market": market_move}
-    mv = implied_factor_moves(m, factors) if co_move else pd.Series(m).reindex(FACTORS).fillna(0.0)
+    mv = implied_factor_moves(m, factors, co_move)
     return float(values @ (B @ mv[FACTORS].values))
 
 
@@ -354,7 +405,9 @@ setup = HedgeSetup(
     horizon_days={"Instantly": 0, "In 1 week": 7, "In 1 month": 30}[horizon_label], vix_beta=vbeta,
 )
 mkt_move = float(moves["market"])
-vix_after = float(np.clip(vix_now + vbeta * mkt_move, 9, 80))
+# A VIX shock you set overrides the usual VIX reaction to the market move.
+vix_after = float(np.clip(vix_now + (shock["vix"] if shock["vix"] else vbeta * mkt_move), 9, 80))
+setup.vix_extra = shock["vix"] - vbeta * mkt_move if shock["vix"] else 0.0
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Exposure per 1% S&P", f"${dollar_beta / 100:,.0f}",
@@ -416,40 +469,181 @@ st.caption(
     "Prices use Black-Scholes with the VIX as volatility plus a simple skew for lower strikes, so real quotes will differ."
 )
 
-# The summary card at the top of step 3, now that the hedges are priced.
+# ---- Step 5: Monte Carlo ----
+step(5, "Simulate thousands of futures",
+     "Monte Carlo: replay random stretches of real market history through your portfolio to see the range of outcomes.")
+mc1, mc2, mc3 = st.columns([1, 2, 2])
+horizon = mc1.selectbox("Horizon", list(HORIZONS), index=1)
+full_label = "All history since 2006 (includes 2008 and 2020)"
+source = mc2.radio("Draw market history from", [full_label, f"Last {years} year(s) only"], horizontal=True)
+hedge_options = [h for h in HEDGES if h != "No hedge"]
+overlay = mc3.selectbox("Compare with a hedge from step 4", ["None"] + hedge_options, index=1)
+trading_days, calendar_days = HORIZONS[horizon]
+mc_history = all_factors if source == full_label else factors
+try:
+    sim = simulate(models, position_values, mc_history, trading_days, freq)
+except ValueError as e:
+    st.info(str(e))
+    sim = None
+
+mc_stats = pd.DataFrame()
+if sim is not None:
+    results = {"No hedge": sim.pnl}
+    if overlay != "None":
+        if overlay in ("Index puts", "Put spread") and calendar_days > expiry_days:
+            st.info(f"The {expiry_days}-day put expires before the {horizon} horizon. Pick a longer put expiry in "
+                    "step 4 to compare it here.")
+        else:
+            mc_setup = replace(setup, horizon_days=calendar_days, vix_extra=0.0)
+            results[overlay] = sim.pnl + hedge_pnl(overlay, mc_setup, sim.market_move, sim.pnl)
+    mc_stats = stats_table(results, sim.value)
+    base_stats = mc_stats.iloc[0]
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Typical outcome", money(base_stats["Typical outcome ($)"]))
+    q2.metric("Bad case (1 in 20)", money(base_stats["Bad case, 1 in 20 ($)"]),
+              help="95% value at risk: 1 in 20 simulations lost more than this.")
+    q3.metric("Average of worst 5%", money(base_stats["Average of worst 5% ($)"]),
+              help="Expected shortfall (CVaR): the average loss in the worst 1 in 20 simulations.")
+    q4.metric("Chance of losing 10%+", f"{base_stats['Chance of losing 10%+ (%)']:.0f}%")
+
+    fl, fr = st.columns([3, 2])
+    with fl:
+        b = sim.bands
+        fan = go.Figure()
+        fan.add_scatter(x=b["Trading days"], y=b["p95"], line=dict(width=0), showlegend=False, hoverinfo="skip")
+        fan.add_scatter(x=b["Trading days"], y=b["p5"], fill="tonexty", fillcolor="rgba(245,166,35,0.15)",
+                        line=dict(width=0), name="90% of outcomes")
+        fan.add_scatter(x=b["Trading days"], y=b["p75"], line=dict(width=0), showlegend=False, hoverinfo="skip")
+        fan.add_scatter(x=b["Trading days"], y=b["p25"], fill="tonexty", fillcolor="rgba(245,166,35,0.35)",
+                        line=dict(width=0), name="Middle 50%")
+        fan.add_scatter(x=b["Trading days"], y=b["p50"], line=dict(color=AMBER, width=2), name="Typical")
+        fan.add_hline(y=0, line_color=BORDER, line_width=1)
+        fan.update_layout(xaxis_title="Trading days from today", yaxis_title="Portfolio change ($)")
+        show_chart(fan, 380)
+    with fr:
+        hist = go.Figure()
+        for name, pnl in results.items():
+            hist.add_histogram(x=pnl, name=name, nbinsx=60, opacity=0.65,
+                               marker_color=TEXT if name == "No hedge" else HEDGE_COLORS[name])
+        hist.add_vline(x=base_stats["Bad case, 1 in 20 ($)"], line_dash="dot", line_color=RED,
+                       annotation_text="1 in 20", annotation_font_color=RED)
+        hist.update_layout(barmode="overlay", xaxis_title=f"Change after {horizon} ($)", yaxis_title="Simulations")
+        show_chart(hist, 380)
+    show_table(
+        mc_stats,
+        {c: money for c in mc_stats.columns if c.endswith("($)")} | {c: "{:.1f}%" for c in mc_stats.columns
+                                                                    if c.endswith("(%)")},
+        [c for c in mc_stats.columns if c.endswith("($)")],
+        hide_index=True,
+    )
+    st.caption(
+        f"{len(sim.pnl):,} simulations, each built from random week-long stretches of real {freq} factor moves, so "
+        "crashes, calm spells and how oil, rates, the dollar and gold moved together all carry over. Each stock adds "
+        "its own random noise. Average returns are removed, so this shows risk, not expected gain. Hedges are "
+        "valued at the horizon with the same option model as step 4."
+    )
+
+# ---- Step 6: efficient frontier ----
+step(6, "Optimize the mix",
+     "A light mean-variance view: where your portfolio sits and what the same stocks could do in other weights.")
+frontier_out = None
+if len(risk_tickers) < 2:
+    st.info("Add at least two holdings to see an efficient frontier.")
+else:
+    o1, o2 = st.columns([2, 1])
+    method = o1.radio("Expected returns", RETURN_METHODS, horizontal=True,
+                      help="Market-implied: T-bill rate + market beta × 5% equity premium (steady, CAPM). "
+                      "Historical: each stock's average return over the fit window (swings a lot).")
+    min_cap = int(5 * np.ceil(100 / len(risk_tickers) / 5))  # the cap must allow weights to add up to 100%
+    cap = o2.slider("Max weight in one stock", min(max(min_cap, 10), 100), 100, max(40, min_cap), 5,
+                    format="%d%%") / 100
+    mu = expected_returns(models, risk_tickers, rate_now, method, returns, ppy)
+    ports = model_portfolios(position_values.reindex(risk_tickers), mu, cov, rate_now, cap)
+    imp = impacts.set_index("Ticker")
+    port_summary, port_weights = compare_portfolios(
+        ports, mu, cov, rate_now, normal["value"], imp["Impact (%)"], imp["Stress impact (%)"]
+    )
+    curve = frontier_curve(mu.values, cov.values, cap)
+    frontier_out = (port_summary, port_weights)
+
+    PORT_STYLE = {
+        "Your portfolio": (TEXT, "circle", 16),
+        "Same expected return, less risk": (GREEN, "diamond", 14),
+        "Lowest risk": (LAVENDER, "square", 13),
+        "Best return per unit of risk": (AMBER, "star", 18),
+    }
+    ef = go.Figure()
+    ef.add_scatter(x=curve["Volatility (%/yr)"], y=curve["Return (%/yr)"], mode="lines", name="Efficient frontier",
+                   line=dict(color=AMBER, width=3))
+    stock_vol = np.sqrt(np.diag(cov.values)) * 100
+    ef.add_scatter(x=stock_vol, y=mu.values * 100, mode="markers+text", text=risk_tickers, textposition="top center",
+                   name="Single stocks", marker=dict(color=MUTED, size=8), textfont=dict(color=MUTED, size=10))
+    for _, r in port_summary.iterrows():
+        color, symbol, size = PORT_STYLE[r["Portfolio"]]
+        ef.add_scatter(x=[r["Volatility (%/yr)"]], y=[r["Expected return (%/yr)"]], mode="markers", name=r["Portfolio"],
+                       marker=dict(color=color, symbol=symbol, size=size, line=dict(color="#0B1F3A", width=1)))
+    ef.update_layout(xaxis_title="Risk: volatility (%/yr)", yaxis_title="Expected return (%/yr)")
+    show_chart(ef, 480, legend=dict(orientation="h", y=-0.18, x=0), margin=dict(l=10, r=10, t=40, b=10))
+
+    show_table(
+        port_summary,
+        {"Expected return (%/yr)": "{:.1f}%", "Volatility (%/yr)": "{:.1f}%", "Sharpe ratio": "{:.2f}",
+         "Scenario, normal ($)": money, "Scenario, stress ($)": money},
+        ["Scenario, normal ($)", "Scenario, stress ($)"],
+        hide_index=True,
+    )
+    st.markdown("**Weights (% of portfolio)**")
+    show_table(port_weights, "{:.1f}%")
+    st.caption(
+        "Built only from stocks you already own, long-only, with no stock above the max weight. Risk comes from the "
+        "factor model. The scenario columns show how each mix would fare in the scenario from step 2. These are "
+        "textbook model portfolios for learning, not recommendations: mean-variance is very sensitive to expected "
+        "returns, which no one knows. Try switching to historical averages to see how much the answer moves."
+    )
+
+# The summary card at the top of step 3, now that hedges, simulations and concentration are done.
 hardest = None
 losers = impacts[impacts["Impact ($)"] < 0]
 if len(losers):
     w = losers.loc[losers["Impact ($)"].idxmin()]
     hardest = (w["Ticker"], float(w["Impact ($)"]), float(w["Impact (%)"]))
-hedge_lines = []
+card_lines = []
 ht = hedge_table.set_index("Hedge")
 if mkt_move <= -0.005 and scenario_impact < 0:
     puts = ht.loc["Index puts"]
     inv = ht.loc["Inverse ETF"]
-    hedge_lines.append(
+    card_lines.append(
         f"Hedging <span class='mono accent'>{hedge_ratio:.0%}</span> of your market exposure with "
         f"<span class='mono'>{n_contracts}</span> SPY put{'s' if n_contracts != 1 else ''} would cost about "
         f"<span class='mono'>${puts['Upfront cost ($)']:,.0f}</span> today and offset about "
         f"<span class='mono accent'>{puts['Loss offset (%)']:.0f}%</span> of this loss"
         + (" (whole contracts over-hedge a portfolio this size)." if over_hedged else ".")
     )
-    hedge_lines.append(
+    card_lines.append(
         f"An inverse S&P ETF sized to the same exposure would offset about "
         f"<span class='mono accent'>{inv['Loss offset (%)']:.0f}%</span> with no premium, but gives up gains if "
         "the market rises. Details in step 4."
     )
 elif mkt_move >= 0.005:
-    hedge_lines.append("This scenario lifts the market, so market hedges would cost you money here.")
+    card_lines.append("This scenario lifts the market, so market hedges would cost you money here.")
+if sim is not None:
+    bad = mc_stats.iloc[0]["Bad case, 1 in 20 ($)"]
+    card_lines.append(
+        f"Over {horizon}, about 1 in 20 simulated futures lost more than "
+        f"<span class='mono neg'>${abs(bad):,.0f}</span> ({abs(bad) / sim.value * 100:.1f}%). Details in step 5."
+    )
+if conc_warnings:
+    card_lines.append(f"<span class='accent'>Concentration:</span> {escape(conc_warnings[0])}")
 summary_slot.html(
     brand.summary_card_html(
         scenario_name, normal["value"], normal["impact"], normal["impact_pct"], stress["impact"],
-        stress["impact_pct"], hardest, hedge_lines,
+        stress["impact_pct"], hardest, card_lines,
     )
 )
 
-# ---- Step 5: compare scenarios ----
-step(5, "Compare scenarios", "The presets, your saved scenarios and the current one, side by side.")
+
+# ---- Step 7: compare scenarios ----
+step(7, "Compare scenarios", "The presets, your saved scenarios and the current one, side by side.")
 current_label = "Current scenario"
 options = list(PRESETS) + list(saved) + [current_label]
 picked = st.multiselect("Scenarios to compare", options, default=list(PRESETS) + list(saved))
@@ -473,8 +667,8 @@ else:
     st.markdown("**Estimated impact per holding ($, normal times)**")
     show_table(cmp_holdings, money, list(cmp_holdings.columns))
 
-# ---- Step 6: check the model ----
-step(6, "Check the model", "Betas behind every estimate, how they changed, and how the model did in real crises.")
+# ---- Step 8: check the model ----
+step(8, "Check the model", "Betas behind every estimate, how they changed, and how the model did in real crises.")
 b1, b2 = st.columns([1, 1])
 with b1:
     beta_tbl = pd.DataFrame({t: m.betas for t, m in models.items()}).T
@@ -544,13 +738,14 @@ else:
         hide_index=True,
     )
 
-# ---- Step 7: export ----
-step(7, "Export", "Download your results to keep, share or open in Excel.")
+# ---- Step 9: export ----
+step(9, "Export", "Download your results to keep, share or open in Excel.")
 settings = [
     ("Holdings", f"{len(impacts)} positions"),
     ("Betas fit on", f"last {years} year(s), {freq} returns"),
     ("Stress betas", f"worst {STRESS_QUANTILE:.0%} of market periods since 2006"),
     ("Co-moves of unset factors", "included" if co_move else "held at 0"),
+    ("Monte Carlo", f"{horizon}, history from {'2006 on' if source == full_label else f'the last {years} year(s)'}"),
     ("Data", "made-up sample data" if use_sample else "Yahoo Finance and FRED"),
 ]
 summary_rows = [
@@ -559,10 +754,21 @@ summary_rows = [
     ("Portfolio value", f"${normal['value']:,.0f}"),
     ("Estimated change, normal times", f"{money(normal['impact'])} ({normal['impact_pct']:+.2f}%)"),
     ("Estimated change, stress times", f"{money(stress['impact'])} ({stress['impact_pct']:+.2f}%)"),
+    ("Yearly volatility", f"{conc['vol']:.1f}% (acts like {conc['effective_n']:.1f} equal positions)"),
 ]
+if not mc_stats.empty:
+    summary_rows.append((f"Bad case over {horizon} (1 in 20)", money(mc_stats.iloc[0]["Bad case, 1 in 20 ($)"])))
+summary_rows += [("Concentration warning", w) for w in conc_warnings]
 beta_export = pd.DataFrame({t: m.betas for t, m in models.items()}).T.rename(columns=FACTOR_LABELS)
 beta_export.insert(0, "Ticker", beta_export.index)
-sheets = {"Scenario": impacts, "Betas": beta_export.reset_index(drop=True), "Hedging": hedge_table}
+sheets = {"Scenario": impacts, "Concentration": conc_table, "Betas": beta_export.reset_index(drop=True),
+          "Hedging": hedge_table}
+if not mc_stats.empty:
+    sheets["Monte Carlo"] = mc_stats
+    sheets["Monte Carlo bands"] = sim.bands.rename(columns=lambda c: f"{c[1:]}th percentile ($)" if c[0] == "p" else c)
+if frontier_out is not None:
+    sheets["Frontier portfolios"] = frontier_out[0]
+    sheets["Frontier weights (%)"] = frontier_out[1].reset_index()
 if not cmp_summary.empty:
     sheets["Compare scenarios"] = cmp_summary
     sheets["Compare by holding"] = cmp_holdings.reset_index(names="Ticker")
@@ -578,11 +784,17 @@ e2.download_button("All tables (Excel)", to_excel(sheets), f"shock_lab_{stamp}.x
 pdf_tables = [("Current scenario", impacts.drop(columns=["Shares", "Low (%)", "High (%)"]))]
 if not cmp_summary.empty:
     pdf_tables.append(("Scenario comparison", cmp_summary))
+pdf_tables.append(("Concentration", conc_table))
 pdf_tables.append(("Hedges in this scenario", hedge_table.drop(columns=["What it means"])))
+if not mc_stats.empty:
+    pdf_tables.append((f"Monte Carlo, {horizon}", mc_stats))
+if frontier_out is not None:
+    pdf_tables.append(("Efficient frontier: model portfolios", frontier_out[0]))
 if replay_table is not None:
     pdf_tables.append((f"Historical replay: {replay_event}", replay_table))
 e3.download_button("Report (PDF)", to_pdf("Shock Lab report", settings, summary_rows, pdf_tables, DISCLAIMER),
                    f"shock_lab_report_{stamp}.pdf", "application/pdf", type="primary", width="stretch")
-st.caption("The Excel file includes the scenario, betas, scenario comparison, hedges and the replay you last viewed.")
+st.caption("The Excel file includes every table above: scenario, concentration, betas, hedges, Monte Carlo, "
+           "frontier portfolios, scenario comparison and the replay you last viewed.")
 
 st.html(f'<div class="sl-disclaimer" style="margin-top:28px">{brand.WATERMARK_TEXT}</div>')

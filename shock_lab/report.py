@@ -32,7 +32,8 @@ def _fmt(v, col: str) -> str:
     if "($)" in col:  # gains and losses get a sign
         return f"{'-' if v < 0 else '+'}${abs(v):,.0f}"
     if "(%)" in col:
-        return f"{v:+.2f}%"
+        unsigned = col.startswith(("Weight", "Share of risk", "Chance"))
+        return f"{v:.1f}%" if unsigned else f"{v:+.2f}%"
     if col == "R²":
         return f"{v:.2f}"
     return f"{v:,.2f}"

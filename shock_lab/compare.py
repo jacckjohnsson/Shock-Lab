@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .model import FACTORS, FactorModel, holding_impacts, implied_factor_moves, portfolio_summary
+from .model import FactorModel, holding_impacts, implied_factor_moves, portfolio_summary
 
 
 def compare_scenarios(
@@ -19,7 +19,7 @@ def compare_scenarios(
     """Return (summary with one row per scenario, $ impact per holding with one column per scenario)."""
     summary_rows, by_holding = [], {}
     for name, shock in scenarios.items():
-        moves = implied_factor_moves(shock, factors) if co_move else pd.Series(shock).reindex(FACTORS).fillna(0.0)
+        moves = implied_factor_moves(shock, factors, co_move)
         impacts = holding_impacts(models, holdings, last_prices, moves, stress_models)
         normal = portfolio_summary(impacts)
         stress = portfolio_summary(impacts.dropna(subset=["Stress impact ($)"]), "Stress impact ($)")

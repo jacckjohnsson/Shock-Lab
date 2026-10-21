@@ -1,6 +1,6 @@
 # Shock Lab
 
-**What happens to my portfolio if oil jumps 20%, rates rise 1 point, the dollar strengthens, or the S&P 500 falls 15%?**
+**What happens to my portfolio if oil jumps 20%, rates rise 1 point, the dollar strengthens, gold rallies, the VIX spikes, credit spreads widen, or the S&P 500 falls 15%?**
 
 Shock Lab lets you type in up to 30 stocks or ETFs with share counts, pick a scenario, and see the estimated
 dollar and percent impact on each holding and on the whole portfolio. It uses the same basic tool risk teams
@@ -44,13 +44,20 @@ CSV downloads. If you are offline, turn on **"Use made-up sample data"** in the 
   converts class shares like `BRK.B` to Yahoo's `BRK-B`. You can edit the result before running. A template
   is available in the app.
 
-**Tabs:**
-- **Scenario:** the sidebar scenario, normal vs stress estimates, per holding and in total.
-- **Compare scenarios:** the four presets plus any scenarios you saved from the sidebar, side by side.
-- **Hedging:** how index puts, a put spread, an inverse ETF or raising cash would change the scenario's result.
-- **Historical replays:** predicted vs actual for 2008, 2020 and 2022.
-- **Model details:** betas and how they changed over time.
-- **Export:** the current scenario as CSV, every table as an Excel workbook, or a one-page PDF report.
+**Then follow the steps** (everything stays on one page, and every detail stays visible):
+1. **Holdings:** type them in or upload a CSV.
+2. **Scenario:** a preset or your own moves in the S&P 500, oil, the 10-year yield, the dollar, gold, the VIX
+   and credit spreads. Click **Run analysis**.
+3. **Impact:** a plain-English summary card, normal vs stress estimates per holding, and a **concentration**
+   check (share of value vs share of risk, with warnings).
+4. **Hedge:** how index puts, a put spread, an inverse ETF or raising cash would change the result, with greeks.
+5. **Simulate:** Monte Carlo over 1 month to 1 year: typical, bad (1 in 20) and very bad (1 in 100) outcomes,
+   with or without a hedge.
+6. **Optimize:** a light efficient frontier built from the stocks you own, and how each model mix fares in
+   your scenario.
+7. **Compare:** the presets plus any scenarios you saved, side by side.
+8. **Check the model:** betas, how they changed over time, and replays of 2008, 2020 and 2022.
+9. **Export:** CSV, an Excel workbook with every table, or a branded PDF report.
 
 ## How it works
 
@@ -62,6 +69,11 @@ CSV downloads. If you are offline, turn on **"Use made-up sample data"** in the 
 | Oil | FRED `DCOILWTICO` (WTI crude, $/barrel) | % change |
 | Rates | FRED `DGS10` (10-year Treasury yield) | change in percentage points |
 | Dollar | FRED `DTWEXBGS` (broad trade-weighted dollar index) | % change |
+| Gold | GLD (gold ETF), Yahoo Finance | % return |
+| VIX *(stress gauge)* | FRED `VIXCLS` | change in VIX points |
+| Credit spread *(stress gauge)* | FRED `BAA10Y` (Baa corporate yield minus 10-year Treasury) | change in percentage points |
+
+The VIX and the 3-month T-bill (`DTB3`) are also used to price options in the hedging step.
 
 Data is downloaded back to 2006 (so the 2008 crisis can be replayed). FRED series that skip a trading day are
 carried forward.
@@ -75,15 +87,15 @@ negative in April 2020, so % changes around those days are dropped.
 
 ### 2. A factor regression for each stock
 
-For each holding *i*, Shock Lab fits an ordinary least squares regression of its daily return on the four factors:
+For each holding *i*, Shock Lab fits an ordinary least squares regression of its daily return on the five factors:
 
 $$
-r_{i,t} = \alpha_i + \beta_{i}^{mkt}\, f^{mkt}_t + \beta_{i}^{oil}\, f^{oil}_t + \beta_{i}^{rates}\, \Delta y_t + \beta_{i}^{usd}\, f^{usd}_t + \varepsilon_{i,t}
+r_{i,t} = \alpha_i + \beta_{i}^{mkt}\, f^{mkt}_t + \beta_{i}^{oil}\, f^{oil}_t + \beta_{i}^{rates}\, \Delta y_t + \beta_{i}^{usd}\, f^{usd}_t + \beta_{i}^{gold}\, f^{gold}_t + \varepsilon_{i,t}
 $$
 
 Each **beta** says how much the stock has tended to move for a 1-unit move in that factor, *holding the others
 fixed*. An oil beta of 0.30 means about +0.3% for every +1% in oil. The rates beta is per 1 percentage point
-change in the 10-year yield. **R²** shows how much of the stock's daily movement the four factors explain.
+change in the 10-year yield. **R²** shows how much of the stock's daily movement the five factors explain.
 
 ### 3. Turning a shock into an impact
 
@@ -112,7 +124,7 @@ The **Historical replays** tab tests the model on real events: the 2008 financia
 2020 and the 2022 rate shock. For each event it:
 
 1. fits betas using **only data from before the event started** (no peeking at the answer),
-2. measures what the four factors actually did during the event,
+2. measures what the factors actually did during the event,
 3. predicts each holding's return as β·(actual factor moves), and
 4. compares that with the holding's actual return.
 
@@ -171,7 +183,48 @@ $$
 \mathbb{E}[\mathbf{f}_{other} \mid \mathbf{f}_{set} = \mathbf{x}] = \Sigma_{other,set}\, \Sigma_{set,set}^{-1}\, \mathbf{x}
 $$
 
-The **Scenario** table in the app shows both what you set and what the model used.
+The **Factor moves** table in the app shows both what you set and what the model used.
+
+### 9. VIX and credit spreads: stress gauges, not betas
+
+The VIX and credit spreads move almost in lockstep with the stock market, so adding them as extra regression
+factors would make every stock's betas unstable (the regression can't tell them apart from the market). Instead
+they are **scenario drivers**: a VIX or credit shock is turned into the S&P, oil, rates, dollar and gold moves
+that have typically come with it (the same conditional-mean formula as above), and stocks react through their
+usual betas. This happens even with co-moves turned off, since a gauge has no beta of its own. A VIX shock you
+set also raises put prices in the hedging step beyond what the market move alone would.
+
+### 10. Concentration
+
+The model gives a covariance matrix for your holdings without needing stock-by-stock history:
+
+$$
+\Sigma = B\, \Sigma_f\, B^\top + D
+$$
+
+where *B* holds the betas, $\Sigma_f$ is the factor covariance and *D* holds each stock's own residual
+variance. Each holding's **share of risk** is $w_i (\Sigma w)_i / w^\top \Sigma w$ (these add to 100%). The app
+warns when one holding is over 25% of value or 35% of risk, or when the portfolio "acts like" fewer than 4 equal
+positions ($1/\sum w_i^2$).
+
+### 11. Monte Carlo
+
+4,000 possible futures are built by stitching together random **week-long blocks of real factor history** (a block
+bootstrap), either since 2006 (includes 2008 and 2020) or only the fit window. Using real blocks keeps fat tails,
+volatility clustering and how the factors move together. Each stock moves by its betas plus normal noise sized to
+its residual volatility, and positions are held without rebalancing. Average factor returns are removed first,
+so the result shows **risk, not expected return**. Reported: the typical (median) outcome, value at risk at 95%
+and 99%, expected shortfall (average of the worst 5%), and the chance of losing anything or 10%+. A hedge from
+step 4 can be overlaid, valued at the horizon with the same option model.
+
+### 12. Efficient frontier (light)
+
+Classic mean-variance optimization over the stocks you already own, long-only, with a cap on any one stock.
+Risk comes from the factor-model covariance above. Expected returns are either **market-implied** (CAPM:
+T-bill rate + market beta × a 5% equity premium, which is steady) or each stock's **historical average** (very
+noisy, included to show how sensitive the optimizer is). The app shows the frontier, your portfolio, the lowest-risk
+mix, the mix with your expected return but less risk, and the highest Sharpe ratio mix, plus how each would fare
+in your scenario. These are textbook illustrations, not recommendations.
 
 ## Limitations (good things to improve next)
 
@@ -181,8 +234,12 @@ The **Scenario** table in the app shows both what you set and what the model use
   weight on recent data without a hard cutoff.
 - **Stress definition is simple.** "Worst 20% of market periods" could be replaced with VIX levels or
   recession dates.
-- **Replays use one beta for the whole event.** Real betas shift during a crisis, and the four factors miss
-  things like credit spreads and company news.
+- **Replays use one beta for the whole event.** Real betas shift during a crisis, and the factors miss
+  company news.
+- **Monte Carlo is only as wide as history.** Bootstrapping can't produce a crash worse than any week since 2006,
+  and stock noise is assumed normal.
+- **Mean-variance needs expected returns no one knows.** The market-implied default is a reasonable anchor, not a
+  forecast. Shrinkage or Black-Litterman views would be natural next steps.
 - **Hedging uses model prices.** Real option quotes, bid/ask spreads and the shape of volatility across
   expiries will differ. Inverse ETFs reset daily, so over long periods they don't exactly track -1x.
 - **Data licensing.** `yfinance` is fine for a personal project, but not licensed for a paid product.
@@ -190,7 +247,7 @@ The **Scenario** table in the app shows both what you set and what the model use
 ## Project layout
 
 ```
-app.py                  Streamlit app (inputs, scenario, results)
+app.py                  Streamlit app (the 9-step guided flow)
 shock_lab/data.py       Downloads from Yahoo Finance and FRED
 shock_lab/model.py      Factor returns, regressions, shock math
 shock_lab/portfolio.py  Cleans the holdings you type in
@@ -201,6 +258,10 @@ shock_lab/importers.py  Reads holdings CSVs and broker exports
 shock_lab/report.py     Excel and PDF exports
 shock_lab/options.py    Black-Scholes prices, greeks and skew
 shock_lab/hedging.py    Hedge sizing, costs and payoffs
+shock_lab/risk.py       Factor-model covariance, risk contributions, concentration warnings
+shock_lab/montecarlo.py Block-bootstrap Monte Carlo and risk stats (VaR, expected shortfall)
+shock_lab/frontier.py   Light mean-variance optimizer and efficient frontier
+shock_lab/brand.py      Colors, logo, chart styling and page fragments
 shock_lab/sample.py     Made-up data with known betas (offline demo and tests)
 tests/                  pytest tests
 ```

@@ -47,6 +47,7 @@ class HedgeSetup:
     expiry_days: int = 90
     horizon_days: int = 0  # how long until the shock (0 = instantly)
     vix_beta: float = -120.0
+    vix_extra: float = 0.0  # extra VIX points in the scenario beyond what the market move implies (a VIX shock)
 
     @property
     def strike(self) -> float:
@@ -64,10 +65,14 @@ class HedgeSetup:
             n = 1
         return n, exact
 
-    def put_value(self, strike: float, market_move=0.0, days_passed: int = 0):
-        """Value per share of a put after the market moves and some days pass."""
+    def put_value(self, strike: float, market_move=0.0, days_passed: int = 0, scenario: bool = False):
+        """Value per share of a put after the market moves and some days pass.
+
+        scenario=True also applies vix_extra, the part of a VIX shock the market move doesn't explain.
+        """
         S = self.spot * (1 + np.asarray(market_move))
-        atm = shocked_vix(self.vix, market_move, self.vix_beta) / 100
+        vix = self.vix + (self.vix_extra if scenario else 0.0)
+        atm = shocked_vix(vix, market_move, self.vix_beta) / 100
         T = max(self.expiry_days - days_passed, 0) / 365
         return bs_put(S, strike, T, self.rate, put_implied_vol(atm, strike, S), DIVIDEND_YIELD)
 
@@ -98,10 +103,10 @@ def hedge_pnl(name: str, h: HedgeSetup, market_move, portfolio_impact) -> np.nda
     n, _ = h.contracts()
     t = h.horizon_days
     if name == "Index puts":
-        return n * CONTRACT_SIZE * (h.put_value(h.strike, m, t) - h.premium(h.strike))
+        return n * CONTRACT_SIZE * (h.put_value(h.strike, m, t, scenario=True) - h.premium(h.strike))
     if name == "Put spread":
         now = h.premium(h.strike) - h.premium(h.spread_strike)
-        later = h.put_value(h.strike, m, t) - h.put_value(h.spread_strike, m, t)
+        later = h.put_value(h.strike, m, t, scenario=True) - h.put_value(h.spread_strike, m, t, scenario=True)
         return n * CONTRACT_SIZE * (later - now)
     if name == "Inverse ETF":
         notional = h.hedge_ratio * h.dollar_beta
