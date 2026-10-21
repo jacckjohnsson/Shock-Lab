@@ -262,7 +262,8 @@ shock_lab/risk.py       Factor-model covariance, risk contributions, concentrati
 shock_lab/montecarlo.py Block-bootstrap Monte Carlo and risk stats (VaR, expected shortfall)
 shock_lab/frontier.py   Light mean-variance optimizer and efficient frontier
 shock_lab/brand.py      Colors, logo, chart styling and page fragments
+shock_lab/landing.py    The welcome screen shown before the app
 shock_lab/sample.py     Made-up data with known betas (offline demo and tests)
 tests/                  pytest tests
-site/                   Landing page (static HTML, links to the app)
+static/                 Screenshots for the welcome screen (served by Streamlit)
 ```
