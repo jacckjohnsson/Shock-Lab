@@ -11,3 +11,6 @@ gatherUsageStats = false
 
 [client]
 toolbarMode = "minimal"
+
+[server]
+enableStaticServing = true  # serves static/ (landing page screenshots) at app/static/

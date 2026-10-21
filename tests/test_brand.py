@@ -34,3 +34,17 @@ def test_branded_pdf_builds():
 
     pdf = to_pdf("Shock Lab report", [("Holdings", "1")], [], [("T", pd.DataFrame({"Impact ($)": [-1.0]}))], "x")
     assert pdf.startswith(b"%PDF")
+
+
+def test_welcome_screen_images_exist():
+    import re
+    from pathlib import Path
+
+    from shock_lab import landing
+
+    html = landing.hero_shot_html() + landing.body_html()
+    names = re.findall(r'src="app/static/([^"]+)"', html)
+    assert len(names) == 5
+    root = Path(__file__).resolve().parents[1] / "static"
+    for n in names:
+        assert (root / n).is_file(), n

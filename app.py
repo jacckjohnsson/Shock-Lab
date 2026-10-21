@@ -15,7 +15,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from shock_lab import brand, data
+from shock_lab import brand, data, landing
 from shock_lab.brand import AMBER, BORDER, CYAN, GREEN, LAVENDER, MUTED, RED, TEXT
 from shock_lab.compare import compare_scenarios
 from shock_lab.frontier import RETURN_METHODS, compare_portfolios, expected_returns, frontier_curve, model_portfolios
@@ -67,6 +67,35 @@ HEDGE_COLORS = {"No hedge": TEXT, "Index puts": AMBER, "Put spread": CYAN, "Inve
 
 st.set_page_config(page_title="Shock Lab", page_icon=str(Path(__file__).parent / "assets" / "icon.png"), layout="wide")
 st.html(brand.CSS)
+st.session_state.setdefault("use_sample", False)
+
+
+def start(demo: bool = False) -> None:
+    st.session_state["started"] = True
+    if demo:  # show results right away with the made-up portfolio
+        st.session_state["use_sample"] = True
+        st.session_state["ran"] = True
+
+
+# ---- Welcome screen (the landing page), shown until someone starts ----
+if not st.session_state.get("started"):
+    st.html(landing.CSS)
+    st.html(landing.brand_bar_html())
+    hero_l, hero_r = st.columns([1, 1.1], gap="large", vertical_alignment="center")
+    with hero_l:
+        st.html(landing.hero_html())
+        c1, c2 = st.columns(2)
+        c1.button("Run a stress test", type="primary", on_click=start, width="stretch")
+        c2.button("Try a demo portfolio", on_click=start, args=(True,), width="stretch")
+        st.html(landing.hero_note_html())
+    with hero_r:
+        st.html(landing.hero_shot_html())
+    st.html(landing.body_html())
+    _, mid, _ = st.columns([2, 1, 2])
+    mid.button("Launch Shock Lab", type="primary", on_click=start, key="start_bottom", width="stretch")
+    st.html(landing.footer_html())
+    st.stop()
+
 st.html(brand.header_html())
 steps_slot = st.empty()
 
@@ -132,8 +161,9 @@ def load_sample():
 with st.sidebar:
     st.html(f'<img src="{brand.logo_data_uri()}" width="56" height="28" alt=""/> '
             f'<span style="font-family:{brand.MONO};letter-spacing:.14em;font-weight:600">SHOCK LAB</span>')
+    st.button("← Back to the overview", on_click=lambda: st.session_state.update(started=False))
     st.header("Model settings")
-    use_sample = st.toggle("Use made-up sample data (works offline)", value=False)
+    use_sample = st.toggle("Use made-up sample data (works offline)", key="use_sample")
     years = st.select_slider(
         "History used to fit betas",
         options=[1, 2, 3, 5, 10],
@@ -252,7 +282,7 @@ try:
     else:
         market, macro, prices = load_live(tuple(holdings["Ticker"]))
 except Exception as e:  # network or data errors
-    st.error(f"Could not load data: {e}")
+    st.error(f"Could not load data: {e}. Turn on the sample data in the sidebar to try the app without live data.")
     st.stop()
 
 missing = [t for t in holdings["Ticker"] if t not in prices.columns]
