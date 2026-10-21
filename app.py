@@ -519,7 +519,7 @@ if sim is not None:
         fan.add_scatter(x=b["Trading days"], y=b["p50"], line=dict(color=AMBER, width=2), name="Typical")
         fan.add_hline(y=0, line_color=BORDER, line_width=1)
         fan.update_layout(xaxis_title="Trading days from today", yaxis_title="Portfolio change ($)")
-        show_chart(fan, 380)
+        show_chart(fan, 400, legend=dict(orientation="h", y=-0.22, x=0))
     with fr:
         hist = go.Figure()
         for name, pnl in results.items():
