@@ -6,6 +6,8 @@ Shock Lab lets you type in up to 30 stocks or ETFs with share counts, pick a sce
 dollar and percent impact on each holding and on the whole portfolio. It uses the same basic tool risk teams
 at banks and hedge funds use for this question: a multi-factor regression.
 
+**Try it live: https://shocklab.streamlit.app/** (click "Try a demo portfolio" to see it with made-up data).
+
 > For education only, not investment advice. Estimates come from a linear model fit to past data.
 > Real markets can behave very differently, especially in a crisis.
 
