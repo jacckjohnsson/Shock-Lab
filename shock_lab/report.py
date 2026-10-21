@@ -38,6 +38,22 @@ def _fmt(v, col: str) -> str:
     return f"{v:,.2f}"
 
 
+def _draw_spike(canvas, x: float, y: float, scale: float, color, width: float) -> None:
+    """The seismograph logo, with (x, y) at the left end of the baseline."""
+    from .brand import SPIKE_POINTS
+
+    pts = [(x + (px - 2) * scale, y - (py - 16) * scale) for px, py in SPIKE_POINTS]
+    canvas.setStrokeColor(color)
+    canvas.setLineWidth(width)
+    canvas.setLineJoin(1)
+    canvas.setLineCap(1)
+    path = canvas.beginPath()
+    path.moveTo(*pts[0])
+    for p in pts[1:]:
+        path.lineTo(*p)
+    canvas.drawPath(path, stroke=1, fill=0)
+
+
 def to_pdf(
     title: str,
     settings: list[tuple[str, str]],
@@ -45,34 +61,66 @@ def to_pdf(
     tables: list[tuple[str, pd.DataFrame]],
     disclaimer: str,
 ) -> bytes:
-    """A simple portrait report: settings, headline numbers, then each table."""
+    """A branded landscape report: header band, settings, headline numbers, then each table.
+
+    Every page carries the Shock Lab header, a faint seismograph watermark and the footer disclaimer.
+    """
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.pagesizes import landscape, letter
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib.units import inch
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+    from .brand import AMBER, NAVY, WATERMARK_TEXT
+
+    navy, amber = colors.HexColor(NAVY), colors.HexColor(AMBER)
+    page_w, page_h = landscape(letter)
+
+    def decorate(canvas, doc) -> None:
+        canvas.saveState()
+        # Header band with logo and wordmark
+        canvas.setFillColor(navy)
+        canvas.rect(0, page_h - 0.6 * inch, page_w, 0.6 * inch, stroke=0, fill=1)
+        _draw_spike(canvas, 0.45 * inch, page_h - 0.3 * inch, 0.55, amber, 1.8)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Courier-Bold", 14)
+        canvas.drawString(0.45 * inch + 36, page_h - 0.35 * inch, "SHOCK LAB")
+        canvas.setFont("Helvetica", 9)
+        canvas.drawRightString(page_w - 0.45 * inch, page_h - 0.35 * inch, f"{title} · {date.today():%B %d, %Y}")
+        # Faint watermark across the middle of the page
+        faint = colors.Color(navy.red, navy.green, navy.blue, alpha=0.05)
+        _draw_spike(canvas, page_w / 2 - 285, page_h / 2 - 20, 9.5, faint, 14)
+        # Footer
+        canvas.setStrokeColor(amber)
+        canvas.setLineWidth(1)
+        canvas.line(0.45 * inch, 0.5 * inch, page_w - 0.45 * inch, 0.5 * inch)
+        canvas.setFillColor(colors.HexColor("#5B6B80"))
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawString(0.45 * inch, 0.33 * inch, WATERMARK_TEXT)
+        canvas.drawRightString(page_w - 0.45 * inch, 0.33 * inch, f"Page {doc.page}")
+        canvas.restoreState()
+
     styles = getSampleStyleSheet()
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter, leftMargin=0.6 * inch, rightMargin=0.6 * inch,
-                            topMargin=0.6 * inch, bottomMargin=0.6 * inch, title=title)
+    doc = SimpleDocTemplate(buf, pagesize=(page_w, page_h), leftMargin=0.45 * inch, rightMargin=0.45 * inch,
+                            topMargin=0.85 * inch, bottomMargin=0.7 * inch, title=title, author="Shock Lab")
     grid = TableStyle(
         [
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#263238")),
+            ("BACKGROUND", (0, 0), (-1, 0), navy),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("LINEBELOW", (0, 0), (-1, 0), 1.2, amber),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
             ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f4f5")]),
-            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cfd8dc")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F1F4F8")]),
+            ("GRID", (0, 1), (-1, -1), 0.25, colors.HexColor("#D5DCE6")),
         ]
     )
-    story = [
-        Paragraph(title, styles["Title"]),
-        Paragraph(f"Generated {date.today():%B %d, %Y}", styles["Normal"]),
-        Spacer(1, 10),
-    ]
-    kv = Table([[k, v] for k, v in settings + summary], hAlign="LEFT", colWidths=[2.2 * inch, 4.5 * inch])
-    kv.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), 9), ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold")]))
+    h3 = styles["Heading3"]
+    h3.textColor = navy
+    story = []
+    kv = Table([[k, v] for k, v in settings + summary], hAlign="LEFT", colWidths=[2.4 * inch, 7.2 * inch])
+    kv.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), 9), ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                            ("TEXTCOLOR", (0, 0), (0, -1), navy)]))
     story += [kv, Spacer(1, 12)]
     for heading, df in tables:
         if df.empty:
@@ -80,7 +128,7 @@ def to_pdf(
         data = [list(map(str, df.columns))] + [[_fmt(v, c) for v, c in zip(row, df.columns)] for row in df.itertuples(index=False)]
         t = Table(data, hAlign="LEFT", repeatRows=1)
         t.setStyle(grid)
-        story += [Paragraph(heading, styles["Heading3"]), t, Spacer(1, 12)]
+        story += [Paragraph(heading, h3), t, Spacer(1, 12)]
     story.append(Paragraph(disclaimer.replace("**", ""), styles["Italic"]))
-    doc.build(story)
+    doc.build(story, onFirstPage=decorate, onLaterPages=decorate)
     return buf.getvalue()
