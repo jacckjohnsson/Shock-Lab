@@ -264,4 +264,5 @@ shock_lab/frontier.py   Light mean-variance optimizer and efficient frontier
 shock_lab/brand.py      Colors, logo, chart styling and page fragments
 shock_lab/sample.py     Made-up data with known betas (offline demo and tests)
 tests/                  pytest tests
+site/                   Landing page (static HTML, links to the app)
 ```
