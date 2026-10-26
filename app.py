@@ -551,13 +551,20 @@ if sim is not None:
         fan.update_layout(xaxis_title="Trading days from today", yaxis_title="Portfolio change ($)")
         show_chart(fan, 400, legend=dict(orientation="h", y=-0.22, x=0))
     with fr:
+        # Shared bins; the unhedged result is filled and a hedge is an outline, so overlaps don't mix colors.
+        edges = np.histogram_bin_edges(np.concatenate(list(results.values())), bins=60)
         hist = go.Figure()
         for name, pnl in results.items():
-            hist.add_histogram(x=pnl, name=name, nbinsx=60, opacity=0.65,
-                               marker_color=TEXT if name == "No hedge" else HEDGE_COLORS[name])
+            counts, _ = np.histogram(pnl, bins=edges)
+            if name == "No hedge":
+                hist.add_bar(x=(edges[:-1] + edges[1:]) / 2, y=counts, width=np.diff(edges), name=name,
+                             marker_color=MUTED, marker_line_width=0, opacity=0.7)
+            else:
+                hist.add_scatter(x=edges, y=np.append(counts, counts[-1]), name=name, mode="lines",
+                                 line=dict(color=HEDGE_COLORS[name], width=2.5, shape="hv"))
         hist.add_vline(x=base_stats["Bad case, 1 in 20 ($)"], line_dash="dot", line_color=RED,
                        annotation_text="1 in 20", annotation_font_color=RED)
-        hist.update_layout(barmode="overlay", xaxis_title=f"Change after {horizon} ($)", yaxis_title="Simulations")
+        hist.update_layout(bargap=0, xaxis_title=f"Change after {horizon} ($)", yaxis_title="Simulations")
         show_chart(hist, 380)
     show_table(
         mc_stats,
